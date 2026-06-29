@@ -553,6 +553,60 @@ def preencher():
             }), 500
 
 
+# ─────────────────────────────────────────────
+# Rota nova — extrai texto do PDF
+# ─────────────────────────────────────────────
+
+@app.route("/comprimir", methods=["POST"])
+def comprimir():
+    """
+    Extrai o texto de um PDF em base64 e retorna como texto puro.
+    Isso reduz o payload de ~4MB para poucos KB antes de enviar ao Claude.
+
+    Payload esperado:
+    {
+      "pdfBase64": "...",
+      "numeroNT": "534540"
+    }
+    """
+    try:
+        import io
+        import pdfplumber
+
+        dados = request.json
+        pdf_base64 = dados.get("pdfBase64")
+        numero_nt  = dados.get("numeroNT", "")
+
+        if not pdf_base64:
+            return jsonify({"erro": "pdfBase64 obrigatorio"}), 400
+
+        pdf_bytes = base64.b64decode(pdf_base64)
+        texto = ""
+        total_paginas = 0
+
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            total_paginas = len(pdf.pages)
+            for page in pdf.pages:
+                texto += page.extract_text() or ""
+                texto += "\n\n"
+
+        texto = texto.strip()
+
+        if not texto:
+            return jsonify({"erro": "Nenhum texto extraído — PDF pode ser imagem escaneada"}), 422
+
+        return jsonify({
+            "numeroNT":   numero_nt,
+            "texto":      texto,
+            "caracteres": len(texto),
+            "paginas":    total_paginas
+        })
+
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
     app.run(host="0.0.0.0", port=port)
