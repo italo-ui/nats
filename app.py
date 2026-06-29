@@ -68,7 +68,6 @@ def _cookie_str(context):
 
 
 def _aguardar_conteudo(page):
-    """Espera o conteúdo dinâmico carregar na página da NT."""
     for seletor in [
         "input.fileform",
         "text=Baixar arquivo",
@@ -78,18 +77,13 @@ def _aguardar_conteudo(page):
     ]:
         try:
             page.wait_for_selector(seletor, timeout=15000)
-            return  # achou — conteúdo carregado
+            return
         except Exception:
             pass
-    # Se nenhum seletor funcionou, espera 5s como fallback
     time.sleep(5)
 
 
 def _navegar_direto(context, page, nt):
-    """
-    Estratégia 1: acessa a página da NT diretamente pela URL.
-    Mais simples e não depende da listagem.
-    """
     url = DADOS_URL.format(nt=nt)
     page.goto(url, timeout=60000)
     page.wait_for_load_state("networkidle", timeout=30000)
@@ -97,7 +91,6 @@ def _navegar_direto(context, page, nt):
     if not _check_logged_in(page):
         raise Exception("Sessão expirada ou cookies inválidos")
 
-    # Verifica se a NT foi encontrada (página não redirecionou para listagem)
     if "notaTecnica-solicitacao-listar" in page.url:
         raise Exception(f"NT {nt} não encontrada — redirecionado para listagem")
 
@@ -106,10 +99,6 @@ def _navegar_direto(context, page, nt):
 
 
 def _navegar_via_listagem(context, page, nt):
-    """
-    Estratégia 2: navega pela listagem → Ações → Nota Técnica.
-    Usada como fallback se a estratégia direta não funcionar.
-    """
     page.goto(LISTA_URL, timeout=60000)
     page.wait_for_load_state("networkidle", timeout=30000)
 
@@ -137,15 +126,10 @@ def _navegar_via_listagem(context, page, nt):
 
 
 def _navegar_ate_pagina_nt(context, page, nt):
-    """
-    Tenta primeiro acesso direto pela URL.
-    Se falhar, cai para navegação via listagem.
-    """
     try:
         return _navegar_direto(context, page, nt)
     except Exception as e1:
         try:
-            # Abre nova aba para a estratégia de listagem
             page2 = context.new_page()
             return _navegar_via_listagem(context, page2, nt)
         except Exception as e2:
@@ -153,10 +137,6 @@ def _navegar_ate_pagina_nt(context, page, nt):
 
 
 def _extrair_hashes(pagina_nt):
-    """
-    Extrai hashes dos inputs .fileform na seção de anexos.
-    Retorna lista de dicts: {hash, nome}
-    """
     hashes = []
     try:
         inputs = pagina_nt.locator("input.fileform")
@@ -182,7 +162,6 @@ def _extrair_hashes(pagina_nt):
 
 
 def _baixar_arquivo(hash_val, cookie_str):
-    """Baixa um arquivo pelo hash via HTTP com os cookies da sessão."""
     url = DOWNLOAD_URL.format(hash=hash_val)
     req = urllib.request.Request(url)
     req.add_header("Cookie", cookie_str)
@@ -192,6 +171,71 @@ def _baixar_arquivo(hash_val, cookie_str):
         conteudo = resp.read()
         content_type = resp.headers.get("Content-Type", "")
     return conteudo, content_type
+
+
+def _selecionar_opcao(page, seletor, valor):
+    """Seleciona uma opção em um <select> pelo valor ou texto visível."""
+    try:
+        page.select_option(seletor, value=valor)
+        return True
+    except Exception:
+        try:
+            page.select_option(seletor, label=valor)
+            return True
+        except Exception:
+            return False
+
+
+def _preencher_campo(page, seletor, valor):
+    """Preenche um campo de texto, limpando antes."""
+    try:
+        page.fill(seletor, "")
+        page.fill(seletor, valor)
+        return True
+    except Exception:
+        return False
+
+
+def _navegar_ate_formulario(context, page, nt):
+    """
+    Navega até a página da NT e clica no botão/link para abrir o formulário
+    de preenchimento da nota técnica.
+    """
+    pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
+
+    # Tenta clicar no botão de preencher/elaborar nota
+    for seletor in [
+        "a:has-text('Preencher')",
+        "a:has-text('Elaborar')",
+        "button:has-text('Preencher')",
+        "button:has-text('Elaborar')",
+        "a:has-text('Nota Técnica')",
+        ".btn:has-text('Preencher')",
+    ]:
+        try:
+            pagina_nt.wait_for_selector(seletor, timeout=5000)
+            with context.expect_page() as nova_pagina_info:
+                pagina_nt.click(seletor)
+            formulario = nova_pagina_info.value
+            formulario.wait_for_load_state("networkidle", timeout=30000)
+            return formulario
+        except Exception:
+            pass
+
+    # Se não abriu nova aba, tenta na mesma página
+    for seletor in [
+        "a:has-text('Preencher')",
+        "a:has-text('Elaborar')",
+        "button:has-text('Preencher')",
+    ]:
+        try:
+            pagina_nt.click(seletor)
+            pagina_nt.wait_for_load_state("networkidle", timeout=30000)
+            return pagina_nt
+        except Exception:
+            pass
+
+    raise Exception("Não foi possível localizar o botão de preenchimento do formulário")
 
 
 # ─────────────────────────────────────────────
@@ -249,10 +293,6 @@ def login():
             return jsonify({"erro": str(e), "screenshot": sc}), 500
 
 
-# ─────────────────────────────────────────────
-# Diagnóstico
-# ─────────────────────────────────────────────
-
 @app.route("/diagnostico/<nt>", methods=["GET"])
 def diagnostico(nt):
     with sync_playwright() as p:
@@ -279,10 +319,6 @@ def diagnostico(nt):
             browser.close()
             return jsonify({"erro": str(e), "screenshot": sc}), 500
 
-
-# ─────────────────────────────────────────────
-# Rota principal — baixa os PDFs pelos hashes
-# ─────────────────────────────────────────────
 
 @app.route("/baixar", methods=["POST"])
 def baixar():
@@ -323,16 +359,13 @@ def baixar():
             for idx, info in enumerate(hashes_validos[:5]):
                 try:
                     conteudo, content_type = _baixar_arquivo(info["hash"], cookies)
-
                     nome = info.get("nome") or f"NT_{nt}_arquivo_{idx+1}.pdf"
-
                     pdfs.append({
                         "nome": nome,
                         "hash": info["hash"],
                         "content_type": content_type,
                         "base64": base64.b64encode(conteudo).decode()
                     })
-
                 except Exception as e:
                     erros.append(f"Arquivo {idx+1} (hash={info['hash'][:12]}...): {str(e)}")
 
@@ -352,6 +385,172 @@ def baixar():
         "pdfs": pdfs,
         "avisos": erros
     })
+
+
+# ─────────────────────────────────────────────
+# Rota nova — preenche o formulário da NT
+# ─────────────────────────────────────────────
+
+@app.route("/preencher", methods=["POST"])
+def preencher():
+    """
+    Preenche o formulário da NT no e-NatJus sem submeter.
+    
+    Payload esperado:
+    {
+      "numeroNT": "534540",
+      "cid": "M16.1",
+      "diagnostico": "Coxartrose primária unilateral",
+      "meios_confirmatorios": "Radiografia de quadril com laudo...",
+      "tipo_tecnologia": "Procedimento",  // Medicamento | Procedimento | Produto
+      "outras_tecnologias": "Fisioterapia, infiltração articular...",
+      "custo_tecnologia": "R$ 15.000,00 conforme orçamento...",
+      "fonte_custo": "Orçamento hospitalar datado de...",
+      "evidencias": "Estudos clínicos demonstram...",
+      "beneficio_esperado": "Alívio da dor e recuperação funcional...",
+      "recomendacao_conitec": "Não avaliada",  // Recomendada | Não Recomendada | Não avaliada
+      "conclusao_favoravel": "Favorável",  // Favorável | Não favorável
+      "conclusao": "Com base nas evidências apresentadas...",
+      "ha_evidencias": "Sim",  // Sim | Não | Não se aplica
+      "urgencia": "Não",  // Sim | Não
+      "referencias": "AUTOR, Nome. Título. Revista, ano...",
+      "natjus_responsavel": "CE",
+      "instituicao_responsavel": "TJCE",
+      "apoio_tutoria": "Não",  // Sim | Não
+      "outras_informacoes": "Questionário do juiz: ..."
+    }
+    """
+    dados = request.json
+    nt = dados.get("numeroNT")
+    if not nt:
+        return jsonify({"erro": "numeroNT obrigatorio"}), 400
+
+    log = []
+    screenshot_final = None
+
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = browser.new_context()
+        page    = context.new_page()
+
+        try:
+            n_cookies = _inject_cookies(context)
+            if n_cookies == 0:
+                browser.close()
+                return jsonify({"erro": "Nenhum cookie configurado."}), 500
+
+            # Navega até o formulário
+            formulario = _navegar_ate_formulario(context, page, nt)
+            log.append("Formulário localizado")
+
+            # ── Diagnóstico Principal ──
+            if dados.get("cid"):
+                ok = _preencher_campo(formulario, "input[name*='cid'], #cid, input[placeholder*='CID']", dados["cid"])
+                log.append(f"CID: {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("diagnostico"):
+                ok = _preencher_campo(formulario, "textarea[name*='diagnostico'], #diagnostico", dados["diagnostico"])
+                log.append(f"Diagnóstico: {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("meios_confirmatorios"):
+                ok = _preencher_campo(formulario, "textarea[name*='meios'], textarea[name*='confirmatorio']", dados["meios_confirmatorios"])
+                log.append(f"Meios confirmatórios: {'OK' if ok else 'FALHOU'}")
+
+            # ── Descrição da Tecnologia ──
+            if dados.get("tipo_tecnologia"):
+                ok = _selecionar_opcao(formulario, "select[name*='tipo'], #tipo_tecnologia", dados["tipo_tecnologia"])
+                log.append(f"Tipo de tecnologia: {'OK' if ok else 'FALHOU'}")
+
+            # ── Outras Tecnologias ──
+            if dados.get("outras_tecnologias"):
+                ok = _preencher_campo(formulario, "textarea[name*='outras_tecnologias'], textarea[name*='alternativas']", dados["outras_tecnologias"])
+                log.append(f"Outras tecnologias: {'OK' if ok else 'FALHOU'}")
+
+            # ── Custo ──
+            if dados.get("custo_tecnologia"):
+                ok = _preencher_campo(formulario, "textarea[name*='custo']", dados["custo_tecnologia"])
+                log.append(f"Custo: {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("fonte_custo"):
+                ok = _preencher_campo(formulario, "textarea[name*='fonte']", dados["fonte_custo"])
+                log.append(f"Fonte do custo: {'OK' if ok else 'FALHOU'}")
+
+            # ── Evidências ──
+            if dados.get("evidencias"):
+                ok = _preencher_campo(formulario, "textarea[name*='evidencia'], textarea[name*='eficacia']", dados["evidencias"])
+                log.append(f"Evidências: {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("beneficio_esperado"):
+                ok = _preencher_campo(formulario, "textarea[name*='beneficio'], textarea[name*='resultado']", dados["beneficio_esperado"])
+                log.append(f"Benefício esperado: {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("recomendacao_conitec"):
+                ok = _selecionar_opcao(formulario, "select[name*='conitec'], select[name*='recomendacao']", dados["recomendacao_conitec"])
+                log.append(f"Recomendação CONITEC: {'OK' if ok else 'FALHOU'}")
+
+            # ── Conclusão ──
+            if dados.get("conclusao_favoravel"):
+                ok = _selecionar_opcao(formulario, "select[name*='favoravel'], select[name*='conclusao_select']", dados["conclusao_favoravel"])
+                log.append(f"Conclusão (favorável/não): {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("conclusao"):
+                ok = _preencher_campo(formulario, "textarea[name*='conclusao']", dados["conclusao"])
+                log.append(f"Conclusão (texto): {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("ha_evidencias"):
+                ok = _selecionar_opcao(formulario, "select[name*='evidencias_select'], select[name*='ha_evidencia']", dados["ha_evidencias"])
+                log.append(f"Há evidências: {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("urgencia"):
+                ok = _selecionar_opcao(formulario, "select[name*='urgencia']", dados["urgencia"])
+                log.append(f"Urgência: {'OK' if ok else 'FALHOU'}")
+
+            # ── Referências ──
+            if dados.get("referencias"):
+                ok = _preencher_campo(formulario, "textarea[name*='referencia'], textarea[name*='bibliograf']", dados["referencias"])
+                log.append(f"Referências: {'OK' if ok else 'FALHOU'}")
+
+            # ── Responsável ──
+            natjus = dados.get("natjus_responsavel", "CE")
+            ok = _selecionar_opcao(formulario, "select[name*='natjus'], select[name*='responsavel']", natjus)
+            log.append(f"NatJus responsável ({natjus}): {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("instituicao_responsavel"):
+                ok = _preencher_campo(formulario, "input[name*='instituicao'], #instituicao", dados["instituicao_responsavel"])
+                log.append(f"Instituição: {'OK' if ok else 'FALHOU'}")
+
+            tutoria = dados.get("apoio_tutoria", "Não")
+            ok = _selecionar_opcao(formulario, "select[name*='tutoria']", tutoria)
+            log.append(f"Apoio tutoria ({tutoria}): {'OK' if ok else 'FALHOU'}")
+
+            if dados.get("outras_informacoes"):
+                ok = _preencher_campo(formulario, "textarea[name*='outras_info'], textarea[name*='outras_informacoes']", dados["outras_informacoes"])
+                log.append(f"Outras informações: {'OK' if ok else 'FALHOU'}")
+
+            # Screenshot final sem submeter
+            screenshot_final = _screenshot_b64(formulario)
+            log.append("Formulário preenchido — NÃO submetido (aguardando aprovação manual)")
+
+            browser.close()
+
+            return jsonify({
+                "sucesso": True,
+                "numeroNT": nt,
+                "log": log,
+                "screenshot": screenshot_final
+            })
+
+        except Exception as e:
+            sc = _screenshot_b64(page)
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return jsonify({
+                "erro": str(e),
+                "log": log,
+                "screenshot": sc
+            }), 500
 
 
 if __name__ == "__main__":
