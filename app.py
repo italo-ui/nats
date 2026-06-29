@@ -7,6 +7,7 @@ app = Flask(__name__)
 ENATJUS_BASE = "https://www.pje.jus.br/e-natjus"
 LOGIN_URL     = f"{ENATJUS_BASE}/index.php"
 LISTA_URL     = f"{ENATJUS_BASE}/notaTecnica-solicitacao-listar.php"
+DADOS_URL     = f"{ENATJUS_BASE}/notaTecnica-dados.php?idNotaTecnica={{nt}}"
 DOWNLOAD_URL  = f"{ENATJUS_BASE}/arquivo-download.php?hash={{hash}}"
 
 COOKIES_JSON_ENV = "ENATJUS_COOKIES"
@@ -63,12 +64,52 @@ def _screenshot_b64(page):
 
 
 def _cookie_str(context):
-    """Monta string de cookies para requisições HTTP."""
     return "; ".join(f"{c['name']}={c['value']}" for c in context.cookies())
 
 
-def _navegar_ate_pagina_nt(context, page, nt):
-    """Navega pela listagem → Ações → Nota Técnica e retorna a nova aba."""
+def _aguardar_conteudo(page):
+    """Espera o conteúdo dinâmico carregar na página da NT."""
+    for seletor in [
+        "input.fileform",
+        "text=Baixar arquivo",
+        ".dm-uploader",
+        "#conteudo form",
+        "#conteudo table",
+    ]:
+        try:
+            page.wait_for_selector(seletor, timeout=15000)
+            return  # achou — conteúdo carregado
+        except Exception:
+            pass
+    # Se nenhum seletor funcionou, espera 5s como fallback
+    time.sleep(5)
+
+
+def _navegar_direto(context, page, nt):
+    """
+    Estratégia 1: acessa a página da NT diretamente pela URL.
+    Mais simples e não depende da listagem.
+    """
+    url = DADOS_URL.format(nt=nt)
+    page.goto(url, timeout=60000)
+    page.wait_for_load_state("networkidle", timeout=30000)
+
+    if not _check_logged_in(page):
+        raise Exception("Sessão expirada ou cookies inválidos")
+
+    # Verifica se a NT foi encontrada (página não redirecionou para listagem)
+    if "notaTecnica-solicitacao-listar" in page.url:
+        raise Exception(f"NT {nt} não encontrada — redirecionado para listagem")
+
+    _aguardar_conteudo(page)
+    return page
+
+
+def _navegar_via_listagem(context, page, nt):
+    """
+    Estratégia 2: navega pela listagem → Ações → Nota Técnica.
+    Usada como fallback se a estratégia direta não funcionar.
+    """
     page.goto(LISTA_URL, timeout=60000)
     page.wait_for_load_state("networkidle", timeout=30000)
 
@@ -91,28 +132,30 @@ def _navegar_ate_pagina_nt(context, page, nt):
 
     pagina_nt = nova_aba_info.value
     pagina_nt.wait_for_load_state("networkidle", timeout=30000)
-
-    # Espera o conteúdo dinâmico carregar
-    for seletor_espera in [
-        "input.fileform",
-        "text=Baixar arquivo",
-        ".dm-uploader",
-        "#conteudo form",
-        "#conteudo table",
-    ]:
-        try:
-            pagina_nt.wait_for_selector(seletor_espera, timeout=15000)
-            break
-        except Exception:
-            pass
-
+    _aguardar_conteudo(pagina_nt)
     return pagina_nt
+
+
+def _navegar_ate_pagina_nt(context, page, nt):
+    """
+    Tenta primeiro acesso direto pela URL.
+    Se falhar, cai para navegação via listagem.
+    """
+    try:
+        return _navegar_direto(context, page, nt)
+    except Exception as e1:
+        try:
+            # Abre nova aba para a estratégia de listagem
+            page2 = context.new_page()
+            return _navegar_via_listagem(context, page2, nt)
+        except Exception as e2:
+            raise Exception(f"Falha nas duas estratégias. Direto: {e1} | Listagem: {e2}")
 
 
 def _extrair_hashes(pagina_nt):
     """
-    Extrai os hashes dos inputs ocultos .fileform na seção de anexos.
-    Retorna lista de dicts: {hash, nome_arquivo}
+    Extrai hashes dos inputs .fileform na seção de anexos.
+    Retorna lista de dicts: {hash, nome}
     """
     hashes = []
     try:
@@ -128,7 +171,7 @@ def _extrair_hashes(pagina_nt):
                 except Exception:
                     pass
 
-                if hash_val.strip():  # ignora hashes vazios
+                if hash_val.strip():
                     hashes.append({"hash": hash_val.strip(), "nome": nome_val.strip()})
             except Exception:
                 pass
@@ -138,7 +181,7 @@ def _extrair_hashes(pagina_nt):
     return hashes
 
 
-def _baixar_arquivo(hash_val, cookie_str, nome_sugerido="arquivo"):
+def _baixar_arquivo(hash_val, cookie_str):
     """Baixa um arquivo pelo hash via HTTP com os cookies da sessão."""
     url = DOWNLOAD_URL.format(hash=hash_val)
     req = urllib.request.Request(url)
@@ -220,13 +263,14 @@ def diagnostico(nt):
             _inject_cookies(context)
             pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
 
-            hashes = _extrair_hashes(pagina_nt)
+            hashes    = _extrair_hashes(pagina_nt)
             screenshot = _screenshot_b64(pagina_nt)
 
             browser.close()
             return jsonify({
                 "nt": nt,
                 "url_pagina": pagina_nt.url,
+                "estrategia": "direta" if "notaTecnica-dados" in pagina_nt.url else "listagem",
                 "hashes_encontrados": hashes,
                 "screenshot": screenshot
             })
@@ -260,11 +304,8 @@ def baixar():
                 browser.close()
                 return jsonify({"erro": "Nenhum cookie configurado."}), 500
 
-            # Navega até a página da NT
             pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
-
-            # Extrai hashes dos anexos
-            hashes = _extrair_hashes(pagina_nt)
+            hashes    = _extrair_hashes(pagina_nt)
             hashes_validos = [h for h in hashes if "hash" in h and h["hash"]]
 
             if not hashes_validos:
@@ -276,19 +317,14 @@ def baixar():
                     "screenshot": sc
                 }), 404
 
-            # Monta cookie string para download HTTP
             cookies = _cookie_str(context)
-            browser.close()  # Pode fechar o browser — download é via HTTP direto
+            browser.close()
 
-            # Baixa cada arquivo
             for idx, info in enumerate(hashes_validos[:5]):
                 try:
                     conteudo, content_type = _baixar_arquivo(info["hash"], cookies)
 
-                    # Define extensão pelo content-type ou nome original
                     nome = info.get("nome") or f"NT_{nt}_arquivo_{idx+1}.pdf"
-                    if not nome.endswith(".pdf") and "pdf" in content_type:
-                        nome = nome + ".pdf" if "." not in nome else nome
 
                     pdfs.append({
                         "nome": nome,
