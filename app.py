@@ -11,10 +11,6 @@ LISTA_URL     = f"{ENATJUS_BASE}/notaTecnica-solicitacao-listar.php"
 COOKIES_JSON_ENV = "ENATJUS_COOKIES"
 
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
-
 def _launch_browser(p):
     return p.chromium.launch(
         headless=True,
@@ -29,7 +25,6 @@ def _launch_browser(p):
 def _inject_cookies(context):
     raw = os.environ.get(COOKIES_JSON_ENV, "[]")
     cookies = json.loads(raw)
-
     playwright_cookies = []
     for c in cookies:
         pc = {
@@ -38,10 +33,8 @@ def _inject_cookies(context):
             "domain": c.get("domain", "www.pje.jus.br"),
             "path":   c.get("path", "/"),
         }
-        if "secure" in c:
-            pc["secure"] = bool(c["secure"])
-        if "httpOnly" in c:
-            pc["httpOnly"] = bool(c["httpOnly"])
+        if "secure" in c:   pc["secure"]   = bool(c["secure"])
+        if "httpOnly" in c: pc["httpOnly"] = bool(c["httpOnly"])
         if "sameSite" in c:
             ss = c["sameSite"]
             if isinstance(ss, str) and ss in ("Strict", "Lax", "None"):
@@ -49,7 +42,6 @@ def _inject_cookies(context):
         if "expirationDate" in c:
             pc["expires"] = float(c["expirationDate"])
         playwright_cookies.append(pc)
-
     if playwright_cookies:
         context.add_cookies(playwright_cookies)
     return len(playwright_cookies)
@@ -57,8 +49,7 @@ def _inject_cookies(context):
 
 def _check_logged_in(page):
     try:
-        nav_text = page.inner_text("nav")
-        return "Login" not in nav_text
+        return "Login" not in page.inner_text("nav")
     except Exception:
         return False
 
@@ -68,6 +59,49 @@ def _screenshot_b64(page):
         return base64.b64encode(page.screenshot(full_page=True)).decode()
     except Exception:
         return None
+
+
+def _navegar_ate_pagina_nt(context, page, nt):
+    page.goto(LISTA_URL, timeout=60000)
+    page.wait_for_load_state("networkidle", timeout=30000)
+
+    if not _check_logged_in(page):
+        raise Exception("Sessão expirada ou cookies inválidos")
+
+    linha = page.locator(f"tr:has-text('{nt}')").first
+    if linha.count() == 0:
+        raise Exception(f"NT {nt} não encontrada na listagem")
+
+    btn_acoes = linha.locator("button, a").filter(has_text="Ações").first
+    if btn_acoes.count() == 0:
+        btn_acoes = linha.locator(".dropdown-toggle, [data-toggle='dropdown']").first
+    btn_acoes.click()
+    time.sleep(1)
+
+    opcao_nt = page.locator("a:has-text('Nota Técnica'), a:has-text('Nota Tecnica')").first
+    with context.expect_page() as nova_aba_info:
+        opcao_nt.click()
+
+    pagina_nt = nova_aba_info.value
+    pagina_nt.wait_for_load_state("networkidle", timeout=30000)
+
+    # Espera o conteúdo dinâmico carregar — aguarda até 15s por qualquer
+    # elemento que indique que a página carregou de verdade
+    for seletor_espera in [
+        "text=Baixar",
+        "text=Anexo",
+        "text=anexo",
+        ".panel-body",
+        "#conteudo table",
+        "#conteudo form",
+    ]:
+        try:
+            pagina_nt.wait_for_selector(seletor_espera, timeout=15000)
+            break  # achou — para de esperar
+        except Exception:
+            pass  # tenta o próximo
+
+    return pagina_nt
 
 
 # ─────────────────────────────────────────────
@@ -126,86 +160,82 @@ def login():
 
 
 # ─────────────────────────────────────────────
-# Rota de diagnóstico — fotografa cada etapa
+# Diagnóstico — inspeciona a página da NT
 # ─────────────────────────────────────────────
 
 @app.route("/diagnostico/<nt>", methods=["GET"])
 def diagnostico(nt):
-    """
-    Percorre o fluxo completo e retorna screenshots de cada etapa.
-    Use para depurar sem precisar baixar PDFs.
-    """
-    etapas = []
-
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context(accept_downloads=True)
         page    = context.new_page()
 
         try:
-            # 1. Injeta cookies e vai para lista
             _inject_cookies(context)
-            page.goto(LISTA_URL, timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=30000)
-            etapas.append({
-                "etapa": "1_lista_carregada",
-                "url": page.url,
-                "autenticado": _check_logged_in(page),
-                "screenshot": _screenshot_b64(page)
-            })
+            pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
 
-            # 2. Procura a linha com o número da NT
-            linha = page.locator(f"tr:has-text('{nt}')").first
-            if linha.count() == 0:
-                etapas.append({"etapa": "2_nt_nao_encontrada", "nt": nt})
-                browser.close()
-                return jsonify({"etapas": etapas})
+            screenshot = _screenshot_b64(pagina_nt)
 
-            etapas.append({
-                "etapa": "2_linha_encontrada",
-                "texto_linha": linha.inner_text(),
-                "screenshot": _screenshot_b64(page)
-            })
+            # Captura o HTML completo da área de conteúdo
+            html_conteudo = ""
+            try:
+                conteudo_div = pagina_nt.locator("#conteudo").first
+                if conteudo_div.count() > 0:
+                    html_conteudo = conteudo_div.inner_html()[:5000]
+                else:
+                    html_conteudo = pagina_nt.content()[:5000]
+            except Exception as ex:
+                html_conteudo = f"Erro ao capturar HTML: {ex}"
 
-            # 3. Clica no botão "Ações" da linha
-            btn_acoes = linha.locator("button, a").filter(has_text="Ações").first
-            if btn_acoes.count() == 0:
-                # Tenta dropdown genérico
-                btn_acoes = linha.locator(".dropdown-toggle, [data-toggle='dropdown']").first
+            # Busca todos os links e botões da página
+            todos_elementos = []
+            try:
+                # Todos os <a>
+                links = pagina_nt.locator("a")
+                for i in range(links.count()):
+                    try:
+                        el = links.nth(i)
+                        todos_elementos.append({
+                            "tag": "a",
+                            "texto": el.inner_text().strip()[:100],
+                            "href": el.get_attribute("href") or "",
+                            "onclick": el.get_attribute("onclick") or "",
+                            "class": el.get_attribute("class") or "",
+                        })
+                    except Exception:
+                        pass
 
-            btn_acoes.click()
-            time.sleep(1)
-            etapas.append({
-                "etapa": "3_acoes_clicado",
-                "screenshot": _screenshot_b64(page)
-            })
+                # Todos os botões
+                botoes = pagina_nt.locator("button, input[type='button'], input[type='submit']")
+                for i in range(botoes.count()):
+                    try:
+                        el = botoes.nth(i)
+                        todos_elementos.append({
+                            "tag": "button",
+                            "texto": (el.inner_text().strip() or el.get_attribute("value") or "")[:100],
+                            "href": "",
+                            "onclick": el.get_attribute("onclick") or "",
+                            "class": el.get_attribute("class") or "",
+                        })
+                    except Exception:
+                        pass
+            except Exception as ex:
+                todos_elementos.append({"erro": str(ex)})
 
-            # 4. Clica em "Nota Técnica" no dropdown
-            opcao_nt = page.locator("a:has-text('Nota Técnica'), a:has-text('Nota Tecnica')").first
-            
-            # Captura nova aba ao clicar
-            with context.expect_page() as nova_aba_info:
-                opcao_nt.click()
-            
-            nova_aba = nova_aba_info.value
-            nova_aba.wait_for_load_state("networkidle", timeout=30000)
-            etapas.append({
-                "etapa": "4_nova_aba_aberta",
-                "url": nova_aba.url,
-                "html_trecho": nova_aba.content()[:3000],
-                "screenshot": _screenshot_b64(nova_aba)
+            browser.close()
+            return jsonify({
+                "nt": nt,
+                "url_pagina": pagina_nt.url,
+                "total_elementos": len(todos_elementos),
+                "elementos": todos_elementos,
+                "html_conteudo_5000chars": html_conteudo,
+                "screenshot": screenshot
             })
 
         except Exception as e:
-            etapas.append({
-                "etapa": "ERRO",
-                "mensagem": str(e),
-                "screenshot": _screenshot_b64(page)
-            })
-
-        browser.close()
-
-    return jsonify({"nt": nt, "etapas": etapas})
+            sc = _screenshot_b64(page)
+            browser.close()
+            return jsonify({"erro": str(e), "screenshot": sc}), 500
 
 
 # ─────────────────────────────────────────────
@@ -227,61 +257,23 @@ def baixar():
         page    = context.new_page()
 
         try:
-            # 1. Injeta cookies
             n_cookies = _inject_cookies(context)
             if n_cookies == 0:
                 browser.close()
-                return jsonify({"erro": "Nenhum cookie configurado. Configure ENATJUS_COOKIES no Railway."}), 500
+                return jsonify({"erro": "Nenhum cookie configurado."}), 500
 
-            # 2. Vai para lista e verifica autenticação
-            page.goto(LISTA_URL, timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=30000)
-            if not _check_logged_in(page):
-                sc = _screenshot_b64(page)
-                browser.close()
-                return jsonify({
-                    "erro": "Sessão expirada ou cookies inválidos. Atualize ENATJUS_COOKIES.",
-                    "screenshot": sc
-                }), 401
+            pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
 
-            # 3. Encontra a linha da NT na tabela
-            # A tabela pode paginar — tenta achar na página atual primeiro
-            linha = page.locator(f"tr:has-text('{nt}')").first
-            if linha.count() == 0:
-                # Tenta buscar diretamente pela URL de dados
-                page.goto(f"{ENATJUS_BASE}/notaTecnica-dados.php?idNotaTecnica={nt}", timeout=60000)
-                page.wait_for_load_state("networkidle", timeout=30000)
-                linha = None  # Sem linha nesse contexto
-
-            # 4. Fluxo via listagem (linha encontrada)
-            if linha and linha.count() > 0:
-                # Clica em "Ações"
-                btn_acoes = linha.locator("button, a").filter(has_text="Ações").first
-                if btn_acoes.count() == 0:
-                    btn_acoes = linha.locator(".dropdown-toggle, [data-toggle='dropdown']").first
-                btn_acoes.click()
-                time.sleep(1)
-
-                # Clica em "Nota Técnica" e captura nova aba
-                opcao_nt = page.locator("a:has-text('Nota Técnica'), a:has-text('Nota Tecnica')").first
-                with context.expect_page() as nova_aba_info:
-                    opcao_nt.click()
-                pagina_nt = nova_aba_info.value
-
-            else:
-                # Fallback: já está na página da NT diretamente
-                pagina_nt = page
-
-            pagina_nt.wait_for_load_state("networkidle", timeout=30000)
-
-            # 5. Encontra e baixa os PDFs na página da NT
+            # Busca botões "Baixar Arquivo"
             seletores_pdf = [
-                "a[href*='.pdf']",
-                "a[href*='download']",
-                "a[href*='arquivo']",
-                "a:has-text('PDF')",
-                "a:has-text('Download')",
+                "a:has-text('Baixar Arquivo')",
+                "a:has-text('Baixar arquivo')",
+                "button:has-text('Baixar Arquivo')",
+                "button:has-text('Baixar arquivo')",
                 "a:has-text('Baixar')",
+                "a[href*='.pdf']",
+                "a[href*='arquivo']",
+                "a[href*='download']",
                 "button:has-text('PDF')",
                 "button:has-text('Download')",
             ]
@@ -293,9 +285,10 @@ def baixar():
                 for i in range(els.count()):
                     el = els.nth(i)
                     try:
-                        href = el.get_attribute("href") or ""
-                        texto = el.inner_text().strip()
-                        chave = href or texto
+                        href    = el.get_attribute("href") or ""
+                        onclick = el.get_attribute("onclick") or ""
+                        texto   = el.inner_text().strip()
+                        chave   = href or onclick or texto
                         if chave and chave not in vistos:
                             vistos.add(chave)
                             links_pdf.append(el)
@@ -306,30 +299,28 @@ def baixar():
                 sc = _screenshot_b64(pagina_nt)
                 browser.close()
                 return jsonify({
-                    "erro": "Nenhum link de PDF encontrado na página da Nota Técnica",
+                    "erro": "Nenhum botão de download encontrado",
                     "url_pagina": pagina_nt.url,
                     "screenshot": sc
                 }), 404
 
-            # 6. Baixa cada PDF
-            for idx, link in enumerate(links_pdf[:5]):  # máximo 5 PDFs
+            for idx, link in enumerate(links_pdf[:5]):
                 try:
                     href = link.get_attribute("href") or ""
 
-                    if href.endswith(".pdf") or "download" in href or "arquivo" in href:
-                        # Link direto — baixa via request HTTP com cookies
+                    if href and (href.endswith(".pdf") or "download" in href or "arquivo" in href):
                         if not href.startswith("http"):
                             href = f"{ENATJUS_BASE}/{href.lstrip('/')}"
-                        
-                        cookies_dict = {c["name"]: c["value"] for c in context.cookies()}
+
                         import urllib.request
+                        cookies_dict = {c["name"]: c["value"] for c in context.cookies()}
                         req = urllib.request.Request(href)
-                        for nome, valor in cookies_dict.items():
-                            req.add_header("Cookie", f"{nome}={valor}")
+                        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies_dict.items())
+                        req.add_header("Cookie", cookie_str)
+                        req.add_header("User-Agent", "Mozilla/5.0")
                         with urllib.request.urlopen(req, timeout=30) as resp:
                             conteudo = resp.read()
                     else:
-                        # Clique com captura de download
                         with pagina_nt.expect_download(timeout=30000) as dl_info:
                             link.click()
                         download = dl_info.value
