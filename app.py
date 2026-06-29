@@ -23,7 +23,17 @@ def baixar():
     erros = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+    headless=True,
+    args=[
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--single-process",
+        "--no-zygote",
+        "--disable-setuid-sandbox"
+    ]
+)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
