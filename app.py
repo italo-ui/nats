@@ -25,6 +25,7 @@ def teste():
 
 @app.route("/screenshot", methods=["GET"])
 def screenshot():
+    capturas = []
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -38,18 +39,88 @@ def screenshot():
         )
         page = browser.new_page()
         try:
+            # Etapa 1: página inicial
             page.goto("https://www.pje.jus.br/e-natjus/index.php", timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
-            img = page.screenshot(full_page=True)
-            html = page.content()
-            browser.close()
-            return jsonify({
-                "screenshot_base64": base64.b64encode(img).decode(),
-                "html_snippet": html[:3000]
+            capturas.append({
+                "etapa": "1_pagina_inicial",
+                "url": page.url,
+                "html": page.content()[:5000],
+                "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
             })
+
+            # Etapa 2: clicar no botão PDPJ
+            seletores = [
+                "text=PDPJ",
+                "text=Marketplace",
+                "a:has-text('PDPJ')",
+                "button:has-text('PDPJ')",
+                "a:has-text('Marketplace')",
+                "[href*='pdpj']",
+                "[href*='sso']",
+                "[href*='keycloak']",
+                "img[alt*='PDPJ']",
+                ".btn-login",
+                "a.btn",
+                "button.btn"
+            ]
+            clicou = False
+            seletor_usado = ""
+            for sel in seletores:
+                try:
+                    el = page.locator(sel).first
+                    if el.count() > 0:
+                        el.click(timeout=5000)
+                        clicou = True
+                        seletor_usado = sel
+                        break
+                except:
+                    continue
+
+            page.wait_for_load_state("networkidle", timeout=30000)
+            capturas.append({
+                "etapa": "2_apos_clicar_pdpj",
+                "clicou": clicou,
+                "seletor_usado": seletor_usado,
+                "url": page.url,
+                "html": page.content()[:5000],
+                "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
+            })
+
+            if clicou:
+                # Etapa 3: preencher login
+                page.fill("input[name='username']", "83069925391")
+                page.fill("input[name='password']", os.environ.get("ENATJUS_SENHA", "d14m01@A80"))
+
+                capturas.append({
+                    "etapa": "3_campos_preenchidos",
+                    "url": page.url,
+                    "html": page.content()[:5000],
+                    "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
+                })
+
+                # Etapa 4: clicar em Entrar
+                page.click("input[type='submit'], button[type='submit'], button:has-text('Entrar'), button:has-text('Login')")
+                page.wait_for_load_state("networkidle", timeout=30000)
+
+                capturas.append({
+                    "etapa": "4_apos_login",
+                    "url": page.url,
+                    "html": page.content()[:5000],
+                    "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
+                })
+
         except Exception as e:
+            capturas.append({
+                "etapa": "erro",
+                "mensagem": str(e),
+                "url": page.url,
+                "html": page.content()[:3000]
+            })
+        finally:
             browser.close()
-            return jsonify({"erro": str(e)}), 500
+
+    return jsonify({"capturas": capturas})
 
 @app.route("/baixar", methods=["POST"])
 def baixar():
@@ -89,11 +160,7 @@ def baixar():
             page.wait_for_load_state("networkidle", timeout=30000)
             print("Página carregada", flush=True)
 
-            # Tira screenshot da página inicial para debug
-            img_inicial = page.screenshot()
-            print(f"Screenshot inicial: {len(img_inicial)} bytes", flush=True)
-
-            # Tenta clicar no botão PDPJ por diferentes seletores
+            # Tenta clicar no botão PDPJ
             seletores_pdpj = [
                 "text=PDPJ",
                 "text=Marketplace",
@@ -101,8 +168,12 @@ def baixar():
                 "button:has-text('PDPJ')",
                 "a:has-text('Marketplace')",
                 "[href*='pdpj']",
-                "[href*='marketplace']",
+                "[href*='sso']",
+                "[href*='keycloak']",
                 "img[alt*='PDPJ']",
+                ".btn-login",
+                "a.btn",
+                "button.btn"
             ]
 
             clicou = False
@@ -119,17 +190,12 @@ def baixar():
                     continue
 
             if not clicou:
-                # Salva HTML para diagnóstico
                 html = page.content()
                 print(f"HTML da página (primeiros 2000 chars): {html[:2000]}", flush=True)
                 raise Exception("Botão PDPJ não encontrado na página")
 
             page.wait_for_load_state("networkidle", timeout=30000)
             print("Página de login PDPJ carregada", flush=True)
-
-            # Tira screenshot da página de login
-            img_login = page.screenshot()
-            print(f"Screenshot login: {len(img_login)} bytes", flush=True)
 
             # Preenche credenciais
             seletores_usuario = [
@@ -213,10 +279,6 @@ def baixar():
             page.goto(url_nt, timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
             print(f"NT {nt} carregada", flush=True)
-
-            # Tira screenshot da página da NT
-            img_nt = page.screenshot()
-            print(f"Screenshot NT: {len(img_nt)} bytes", flush=True)
 
             # Localiza botões de PDF
             seletores_pdf = [
