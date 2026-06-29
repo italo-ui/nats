@@ -3,10 +3,18 @@ from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
-SENHA = os.environ["ENATJUS_SENHA"]
+
+@app.route("/", methods=["GET"])
+def health():
+    return "OK", 200
 
 @app.route("/baixar", methods=["POST"])
 def baixar():
+    # Lê a senha aqui dentro, não no início do arquivo
+    SENHA = os.environ.get("ENATJUS_SENHA", "")
+    if not SENHA:
+        return jsonify({"erro": "Variável ENATJUS_SENHA não configurada no Railway"}), 500
+
     nt = request.json.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
