@@ -25,7 +25,6 @@ def teste():
 
 @app.route("/login", methods=["GET"])
 def login():
-    """Apenas faz o login e retorna o HTML da página resultante"""
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -35,15 +34,10 @@ def login():
         try:
             page.goto("https://www.pje.jus.br/e-natjus/index.php", timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
-
-            page.select_option("select[name='modalidade']", value="3")
             page.fill("input[name='login']", "83069925391")
-            page.fill("input[name='senha']", os.environ.get("ENATJUS_SENHA", "d14m01@A80"))
-
-            # Submete o formulário
+            page.fill("input[name='senha']", os.environ.get("ENATJUS_SENHA", ""))
             page.click("button[type='submit'], input[type='submit'], button:has-text('Entrar')")
             time.sleep(8)
-
             resultado = {
                 "url_final": page.url,
                 "html": page.content()[:4000],
@@ -51,78 +45,57 @@ def login():
             }
             browser.close()
             return jsonify(resultado)
-
         except Exception as e:
             browser.close()
             return jsonify({"erro": str(e), "url": page.url}), 500
 
 @app.route("/baixar", methods=["POST"])
 def baixar():
-    SENHA = os.environ.get("ENATJUS_SENHA", "d14m01@A80")
-
+    SENHA = os.environ.get("ENATJUS_SENHA", "")
     nt = request.json.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
 
-    print(f"Iniciando download NT: {nt}", flush=True)
     pdfs = []
     erros = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
-                "--single-process","--no-zygote","--disable-setuid-sandbox",
-                "--disable-extensions","--memory-pressure-off"
-            ]
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
+                  "--single-process","--no-zygote","--disable-setuid-sandbox",
+                  "--disable-extensions","--memory-pressure-off"]
         )
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
         try:
-            print("Acessando e-NatJus...", flush=True)
             page.goto("https://www.pje.jus.br/e-natjus/index.php", timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
-
-            page.select_option("select[name='modalidade']", value="3")
             page.fill("input[name='login']", "83069925391")
             page.fill("input[name='senha']", SENHA)
-
             page.click("button[type='submit'], input[type='submit'], button:has-text('Entrar')")
             time.sleep(8)
             page.wait_for_load_state("networkidle", timeout=60000)
-            print(f"Login realizado. URL: {page.url}", flush=True)
 
             url_nt = f"https://www.pje.jus.br/e-natjus/notaTecnica-dados.php?idNotaTecnica={nt}"
             page.goto(url_nt, timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
-            print(f"NT {nt} carregada. URL: {page.url}", flush=True)
 
             seletores_pdf = [
-                "a[href*='.pdf']",
-                "a[href*='download']",
-                "a:has-text('PDF')",
-                "a:has-text('Download')",
-                "button:has-text('PDF')",
-                "button:has-text('Download')",
-                "input[type='button'][value*='PDF']",
-                "input[type='submit'][value*='PDF']",
+                "a[href*='.pdf']","a[href*='download']",
+                "a:has-text('PDF')","a:has-text('Download')",
+                "button:has-text('PDF')","button:has-text('Download')",
+                "input[type='button'][value*='PDF']","input[type='submit'][value*='PDF']",
             ]
-
             botoes = []
             for sel in seletores_pdf:
                 els = page.locator(sel)
-                count = els.count()
-                print(f"Seletor PDF '{sel}': {count} elementos", flush=True)
-                for i in range(min(count, 3)):
+                for i in range(min(els.count(), 3)):
                     botoes.append(els.nth(i))
-
-            print(f"Total de botões PDF: {len(botoes)}", flush=True)
 
             for idx, botao in enumerate(botoes[:3]):
                 try:
-                    print(f"Baixando PDF {idx+1}...", flush=True)
                     with context.expect_download(timeout=30000) as dl:
                         botao.click()
                     download = dl.value
@@ -134,14 +107,11 @@ def baixar():
                         "nome": f"NT_{nt}_arquivo_{idx+1}.pdf",
                         "base64": base64.b64encode(conteudo).decode()
                     })
-                    print(f"PDF {idx+1} baixado: {len(conteudo)} bytes", flush=True)
                     time.sleep(2)
                 except Exception as e:
-                    print(f"Erro PDF {idx+1}: {e}", flush=True)
                     erros.append(f"PDF {idx+1}: {str(e)}")
 
         except Exception as e:
-            print(f"Erro geral: {e}", flush=True)
             browser.close()
             return jsonify({"erro": str(e), "avisos": erros}), 500
 
@@ -150,10 +120,8 @@ def baixar():
     if not pdfs:
         return jsonify({"erro": "Nenhum PDF baixado", "detalhes": erros}), 500
 
-    print(f"Concluído: {len(pdfs)} PDFs baixados", flush=True)
     return jsonify({"numeroNT": nt, "pdfs": pdfs, "avisos": erros})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print(f"Iniciando servidor na porta {port}", flush=True)
     app.run(host="0.0.0.0", port=port)
