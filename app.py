@@ -29,93 +29,50 @@ def screenshot():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process",
-                "--no-zygote"
-            ]
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--single-process","--no-zygote"]
         )
         page = browser.new_page()
         try:
-            # Etapa 1: página inicial
+            # Etapa 1: carrega a página
             page.goto("https://www.pje.jus.br/e-natjus/index.php", timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
             capturas.append({
                 "etapa": "1_pagina_inicial",
                 "url": page.url,
-                "html": page.content()[:5000],
-                "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
+                "html": page.content()[:3000]
             })
 
-            # Etapa 2: clicar no botão PDPJ
-            seletores = [
-                "text=PDPJ",
-                "text=Marketplace",
-                "a:has-text('PDPJ')",
-                "button:has-text('PDPJ')",
-                "a:has-text('Marketplace')",
-                "[href*='pdpj']",
-                "[href*='sso']",
-                "[href*='keycloak']",
-                "img[alt*='PDPJ']",
-                ".btn-login",
-                "a.btn",
-                "button.btn"
-            ]
-            clicou = False
-            seletor_usado = ""
-            for sel in seletores:
-                try:
-                    el = page.locator(sel).first
-                    if el.count() > 0:
-                        el.click(timeout=5000)
-                        clicou = True
-                        seletor_usado = sel
-                        break
-                except:
-                    continue
+            # Etapa 2: seleciona PDPJ no dropdown
+            page.select_option("select[name='modalidade']", value="3")
+            print("Selecionou PDPJ", flush=True)
 
-            page.wait_for_load_state("networkidle", timeout=30000)
+            # Etapa 3: preenche login
+            page.fill("input[name='login']", "83069925391")
+            page.fill("input[name='senha']", os.environ.get("ENATJUS_SENHA", "d14m01@A80"))
+
             capturas.append({
-                "etapa": "2_apos_clicar_pdpj",
-                "clicou": clicou,
-                "seletor_usado": seletor_usado,
+                "etapa": "2_campos_preenchidos",
                 "url": page.url,
-                "html": page.content()[:5000],
-                "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
+                "screenshot": base64.b64encode(page.screenshot()).decode()
             })
 
-            if clicou:
-                # Etapa 3: preencher login
-                page.fill("input[name='username']", "83069925391")
-                page.fill("input[name='password']", os.environ.get("ENATJUS_SENHA", "d14m01@A80"))
+            # Etapa 4: submete o formulário
+            page.click("button[type='submit'], input[type='submit'], button:has-text('Entrar'), button:has-text('Login')")
+            page.wait_for_load_state("networkidle", timeout=30000)
 
-                capturas.append({
-                    "etapa": "3_campos_preenchidos",
-                    "url": page.url,
-                    "html": page.content()[:5000],
-                    "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
-                })
-
-                # Etapa 4: clicar em Entrar
-                page.click("input[type='submit'], button[type='submit'], button:has-text('Entrar'), button:has-text('Login')")
-                page.wait_for_load_state("networkidle", timeout=30000)
-
-                capturas.append({
-                    "etapa": "4_apos_login",
-                    "url": page.url,
-                    "html": page.content()[:5000],
-                    "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
-                })
+            capturas.append({
+                "etapa": "3_apos_login",
+                "url": page.url,
+                "html": page.content()[:3000],
+                "screenshot": base64.b64encode(page.screenshot()).decode()
+            })
 
         except Exception as e:
             capturas.append({
                 "etapa": "erro",
                 "mensagem": str(e),
                 "url": page.url,
-                "html": page.content()[:3000]
+                "html": page.content()[:2000]
             })
         finally:
             browser.close()
@@ -135,22 +92,14 @@ def baixar():
     erros = []
 
     with sync_playwright() as p:
-        print("Playwright iniciado", flush=True)
         browser = p.chromium.launch(
             headless=True,
             args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process",
-                "--no-zygote",
-                "--disable-setuid-sandbox",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--memory-pressure-off"
+                "--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
+                "--single-process","--no-zygote","--disable-setuid-sandbox",
+                "--disable-extensions","--memory-pressure-off"
             ]
         )
-        print("Browser aberto", flush=True)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
@@ -160,125 +109,25 @@ def baixar():
             page.wait_for_load_state("networkidle", timeout=30000)
             print("Página carregada", flush=True)
 
-            # Tenta clicar no botão PDPJ
-            seletores_pdpj = [
-                "text=PDPJ",
-                "text=Marketplace",
-                "a:has-text('PDPJ')",
-                "button:has-text('PDPJ')",
-                "a:has-text('Marketplace')",
-                "[href*='pdpj']",
-                "[href*='sso']",
-                "[href*='keycloak']",
-                "img[alt*='PDPJ']",
-                ".btn-login",
-                "a.btn",
-                "button.btn"
-            ]
-
-            clicou = False
-            for sel in seletores_pdpj:
-                try:
-                    elemento = page.locator(sel).first
-                    if elemento.count() > 0:
-                        elemento.click(timeout=5000)
-                        print(f"Clicou em PDPJ usando seletor: {sel}", flush=True)
-                        clicou = True
-                        break
-                except Exception as e:
-                    print(f"Seletor '{sel}' falhou: {e}", flush=True)
-                    continue
-
-            if not clicou:
-                html = page.content()
-                print(f"HTML da página (primeiros 2000 chars): {html[:2000]}", flush=True)
-                raise Exception("Botão PDPJ não encontrado na página")
-
-            page.wait_for_load_state("networkidle", timeout=30000)
-            print("Página de login PDPJ carregada", flush=True)
+            # Seleciona PDPJ no dropdown
+            page.select_option("select[name='modalidade']", value="3")
+            print("PDPJ selecionado", flush=True)
 
             # Preenche credenciais
-            seletores_usuario = [
-                "input[name='username']",
-                "input[name='user']",
-                "input[name='login']",
-                "input[type='text']",
-                "input[id*='user']",
-                "input[id*='login']",
-                "#username",
-            ]
+            page.fill("input[name='login']", "83069925391")
+            page.fill("input[name='senha']", SENHA)
+            print("Credenciais preenchidas", flush=True)
 
-            preencheu_usuario = False
-            for sel in seletores_usuario:
-                try:
-                    campo = page.locator(sel).first
-                    if campo.count() > 0:
-                        campo.fill("83069925391")
-                        print(f"Usuário preenchido com seletor: {sel}", flush=True)
-                        preencheu_usuario = True
-                        break
-                except:
-                    continue
-
-            if not preencheu_usuario:
-                raise Exception("Campo de usuário não encontrado")
-
-            seletores_senha = [
-                "input[name='password']",
-                "input[name='senha']",
-                "input[type='password']",
-                "input[id*='pass']",
-                "input[id*='senha']",
-                "#password",
-            ]
-
-            preencheu_senha = False
-            for sel in seletores_senha:
-                try:
-                    campo = page.locator(sel).first
-                    if campo.count() > 0:
-                        campo.fill(SENHA)
-                        print(f"Senha preenchida com seletor: {sel}", flush=True)
-                        preencheu_senha = True
-                        break
-                except:
-                    continue
-
-            if not preencheu_senha:
-                raise Exception("Campo de senha não encontrado")
-
-            seletores_entrar = [
-                "button:has-text('Entrar')",
-                "input[type='submit']",
-                "button[type='submit']",
-                "button:has-text('Login')",
-                "button:has-text('Acessar')",
-                "[value='Entrar']",
-            ]
-
-            clicou_entrar = False
-            for sel in seletores_entrar:
-                try:
-                    btn = page.locator(sel).first
-                    if btn.count() > 0:
-                        btn.click(timeout=5000)
-                        print(f"Botão Entrar clicado com seletor: {sel}", flush=True)
-                        clicou_entrar = True
-                        break
-                except:
-                    continue
-
-            if not clicou_entrar:
-                raise Exception("Botão Entrar não encontrado")
-
+            # Submete o formulário
+            page.click("button[type='submit'], input[type='submit'], button:has-text('Entrar')")
             page.wait_for_load_state("networkidle", timeout=30000)
-            print("Login realizado", flush=True)
+            print(f"Login realizado. URL atual: {page.url}", flush=True)
 
-            # Navega para a NT
+            # Navega direto para a NT
             url_nt = f"https://www.pje.jus.br/e-natjus/notaTecnica-dados.php?idNotaTecnica={nt}"
             page.goto(url_nt, timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
-            print(f"NT {nt} carregada", flush=True)
+            print(f"NT {nt} carregada. URL: {page.url}", flush=True)
 
             # Localiza botões de PDF
             seletores_pdf = [
@@ -300,23 +149,9 @@ def baixar():
                 for i in range(min(count, 3)):
                     botoes.append(els.nth(i))
 
-            # Remove duplicatas mantendo ordem
-            vistos = set()
-            botoes_unicos = []
-            for b in botoes:
-                try:
-                    txt = b.inner_text()
-                    href = b.get_attribute("href") or ""
-                    chave = txt + href
-                    if chave not in vistos:
-                        vistos.add(chave)
-                        botoes_unicos.append(b)
-                except:
-                    botoes_unicos.append(b)
+            print(f"Total de botões PDF: {len(botoes)}", flush=True)
 
-            print(f"Total de botões PDF únicos: {len(botoes_unicos)}", flush=True)
-
-            for idx, botao in enumerate(botoes_unicos[:3]):
+            for idx, botao in enumerate(botoes[:3]):
                 try:
                     print(f"Baixando PDF {idx+1}...", flush=True)
                     with context.expect_download(timeout=30000) as dl:
@@ -338,11 +173,6 @@ def baixar():
 
         except Exception as e:
             print(f"Erro geral: {e}", flush=True)
-            try:
-                img_erro = page.screenshot()
-                print(f"Screenshot do erro: {len(img_erro)} bytes", flush=True)
-            except:
-                pass
             browser.close()
             return jsonify({"erro": str(e), "avisos": erros}), 500
 
