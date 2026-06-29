@@ -1,4 +1,4 @@
-import os, time, base64
+import os, time, base64, subprocess
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 
@@ -7,6 +7,21 @@ app = Flask(__name__)
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
+
+@app.route("/teste", methods=["GET"])
+def teste():
+    try:
+        result = subprocess.run(
+            ["python", "-c", "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage','--single-process']); b.close(); p.stop(); print('OK')"],
+            capture_output=True, text=True, timeout=60
+        )
+        return jsonify({
+            "playwright": "OK" if result.returncode == 0 else "ERRO",
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip()
+        })
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
 @app.route("/baixar", methods=["POST"])
 def baixar():
