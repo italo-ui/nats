@@ -1,11 +1,15 @@
-import os, time, base64, subprocess
+import os, time, base64, json, subprocess
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
 
-LOGIN_URL = "https://www.pje.jus.br/e-natjus/index.php"
-CPF       = "83069925391"
+ENATJUS_BASE = "https://www.pje.jus.br/e-natjus"
+LOGIN_URL     = f"{ENATJUS_BASE}/index.php"
+
+# Cookies exportados do Chrome (JSON array) ficam nesta variável de ambiente
+# Exemplo: '[{"name":"PHPSESSID","value":"abc123","domain":"www.pje.jus.br",...}]'
+COOKIES_JSON_ENV = "ENATJUS_COOKIES"
 
 def _launch_browser(p):
     return p.chromium.launch(
@@ -15,31 +19,50 @@ def _launch_browser(p):
               "--disable-extensions","--memory-pressure-off"]
     )
 
-def _do_login(page, SENHA):
+def _inject_cookies(context):
     """
-    Fluxo real:
-    1. Abre index.php
-    2. loginPDPJ() executa automaticamente e redireciona para SSO PDPJ
-    3. Aguarda a página SSO carregar (com CPF pré-preenchido)
-    4. Preenche só a senha e submete
-    5. Aguarda voltar para o e-NatJus
+    Lê os cookies exportados do Chrome da variável de ambiente
+    e os injeta no contexto do Playwright.
     """
-    # Abre a página — o JS vai redirecionar automaticamente para o SSO
-    page.goto(LOGIN_URL, timeout=60000)
+    raw = os.environ.get(COOKIES_JSON_ENV, "[]")
+    cookies = json.loads(raw)
 
-    # Aguarda redirect para o SSO (até 45s — pode ser lento)
-    page.wait_for_url("**/sso*/**", timeout=45000)
-    page.wait_for_load_state("networkidle", timeout=30000)
+    # Playwright exige campos específicos — normaliza o formato do Cookie-Editor
+    playwright_cookies = []
+    for c in cookies:
+        pc = {
+            "name":   c.get("name", ""),
+            "value":  c.get("value", ""),
+            "domain": c.get("domain", "www.pje.jus.br"),
+            "path":   c.get("path", "/"),
+        }
+        # Campos opcionais
+        if "secure" in c:
+            pc["secure"] = bool(c["secure"])
+        if "httpOnly" in c:
+            pc["httpOnly"] = bool(c["httpOnly"])
+        if "sameSite" in c:
+            # Playwright aceita: "Strict" | "Lax" | "None"
+            ss = c["sameSite"]
+            if isinstance(ss, str) and ss in ("Strict", "Lax", "None"):
+                pc["sameSite"] = ss
+        # expires: Cookie-Editor usa número Unix; Playwright aceita float
+        if "expirationDate" in c:
+            pc["expires"] = float(c["expirationDate"])
+        playwright_cookies.append(pc)
 
-    # O CPF já vem pré-preenchido — só preenche a senha
-    page.fill("input[type='password']", SENHA)
+    if playwright_cookies:
+        context.add_cookies(playwright_cookies)
+    return len(playwright_cookies)
 
-    # Submete
-    page.click("input[type='submit'], button[type='submit'], button:has-text('Entrar'), button:has-text('Login')")
 
-    # Aguarda voltar para o e-NatJus
-    page.wait_for_url("**/e-natjus/**", timeout=45000)
-    page.wait_for_load_state("networkidle", timeout=30000)
+def _check_logged_in(page):
+    """Verifica se está autenticado: menu não deve ter botão 'Login'."""
+    try:
+        nav_text = page.inner_text("nav")
+        return "Login" not in nav_text
+    except Exception:
+        return False
 
 
 @app.route("/", methods=["GET"])
@@ -69,14 +92,25 @@ def teste():
 
 @app.route("/login", methods=["GET"])
 def login():
-    """Rota de diagnóstico: testa login completo e retorna URL + screenshot."""
-    SENHA = os.environ.get("ENATJUS_SENHA", "")
+    """
+    Rota de diagnóstico: injeta cookies do Chrome, acessa o e-NatJus
+    e verifica se está autenticado.
+    """
     with sync_playwright() as p:
         browser = _launch_browser(p)
-        page = browser.new_page()
+        context = browser.new_context()
+        page    = context.new_page()
         try:
-            _do_login(page, SENHA)
+            n_cookies = _inject_cookies(context)
+
+            page.goto(LOGIN_URL, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+
+            autenticado = _check_logged_in(page)
+
             resultado = {
+                "cookies_injetados": n_cookies,
+                "autenticado": autenticado,
                 "url_final": page.url,
                 "html": page.content()[:5000],
                 "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
@@ -94,7 +128,6 @@ def login():
 
 @app.route("/baixar", methods=["POST"])
 def baixar():
-    SENHA = os.environ.get("ENATJUS_SENHA", "")
     nt = request.json.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
@@ -108,10 +141,24 @@ def baixar():
         page    = context.new_page()
 
         try:
-            _do_login(page, SENHA)
+            n_cookies = _inject_cookies(context)
+            if n_cookies == 0:
+                browser.close()
+                return jsonify({"erro": "Nenhum cookie configurado. Configure ENATJUS_COOKIES no Railway."}), 500
+
+            # Verifica autenticação antes de continuar
+            page.goto(LOGIN_URL, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+            if not _check_logged_in(page):
+                sc = base64.b64encode(page.screenshot(full_page=True)).decode()
+                browser.close()
+                return jsonify({
+                    "erro": "Sessão expirada ou cookies inválidos. Atualize ENATJUS_COOKIES.",
+                    "screenshot": sc
+                }), 401
 
             # Navega para a NT
-            url_nt = f"https://www.pje.jus.br/e-natjus/notaTecnica-dados.php?idNotaTecnica={nt}"
+            url_nt = f"{ENATJUS_BASE}/notaTecnica-dados.php?idNotaTecnica={nt}"
             page.goto(url_nt, timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
 
