@@ -25,7 +25,7 @@ def teste():
 
 @app.route("/baixar", methods=["POST"])
 def baixar():
-    SENHA = os.environ.get("ENATJUS_SENHA", "")
+    SENHA = os.environ.get("ENATJUS_SENHA", "d14m01@A80")
     if not SENHA:
         return jsonify({"erro": "Variável ENATJUS_SENHA não configurada"}), 500
 
