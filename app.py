@@ -4,39 +4,42 @@ from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
 
-LOGIN_URL    = "https://www.pje.jus.br/e-natjus/index.php"
-CPF          = "83069925391"
+LOGIN_URL = "https://www.pje.jus.br/e-natjus/index.php"
+CPF       = "83069925391"
+
+def _launch_browser(p):
+    return p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
+              "--single-process","--no-zygote","--disable-setuid-sandbox",
+              "--disable-extensions","--memory-pressure-off"]
+    )
 
 def _do_login(page, SENHA):
     """
-    Segue o fluxo Keycloak do e-NatJus:
-    1. Abre a página principal
-    2. Clica no botão 'Login' que dispara loginPDPJ() → redireciona para SSO Keycloak
-    3. Preenche CPF e senha no formulário Keycloak
-    4. Aguarda retorno para o e-NatJus
-    Retorna True se logado, False caso contrário.
+    Fluxo real:
+    1. Abre index.php
+    2. loginPDPJ() executa automaticamente e redireciona para SSO PDPJ
+    3. Aguarda a página SSO carregar (com CPF pré-preenchido)
+    4. Preenche só a senha e submete
+    5. Aguarda voltar para o e-NatJus
     """
+    # Abre a página — o JS vai redirecionar automaticamente para o SSO
     page.goto(LOGIN_URL, timeout=60000)
+
+    # Aguarda redirect para o SSO (até 45s — pode ser lento)
+    page.wait_for_url("**/sso*/**", timeout=45000)
     page.wait_for_load_state("networkidle", timeout=30000)
 
-    # Clica no link/botão 'Login' que dispara loginPDPJ()
-    page.click("a:has-text('Login'), button:has-text('Login')", timeout=10000)
+    # O CPF já vem pré-preenchido — só preenche a senha
+    page.fill("input[type='password']", SENHA)
 
-    # Aguarda redirecionar para o SSO Keycloak (URL muda para sso.cloud.pje.jus.br)
-    page.wait_for_url("**/auth/**", timeout=30000)
-    page.wait_for_load_state("networkidle", timeout=30000)
-
-    # Preenche o formulário Keycloak
-    page.fill("input[name='username'], input[id='username'], input[type='text']", CPF)
-    page.fill("input[name='password'], input[id='password'], input[type='password']", SENHA)
+    # Submete
     page.click("input[type='submit'], button[type='submit'], button:has-text('Entrar'), button:has-text('Login')")
 
     # Aguarda voltar para o e-NatJus
-    page.wait_for_url("**/e-natjus/**", timeout=30000)
+    page.wait_for_url("**/e-natjus/**", timeout=45000)
     page.wait_for_load_state("networkidle", timeout=30000)
-
-    # Verifica se está autenticado (menu não deve mais mostrar botão 'Login')
-    return "Login" not in page.inner_text("nav")
 
 
 @app.route("/", methods=["GET"])
@@ -66,19 +69,14 @@ def teste():
 
 @app.route("/login", methods=["GET"])
 def login():
-    """Rota de diagnóstico: testa o fluxo Keycloak e retorna HTML + screenshot."""
+    """Rota de diagnóstico: testa login completo e retorna URL + screenshot."""
     SENHA = os.environ.get("ENATJUS_SENHA", "")
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
-                  "--single-process","--no-zygote"]
-        )
+        browser = _launch_browser(p)
         page = browser.new_page()
         try:
-            autenticado = _do_login(page, SENHA)
+            _do_login(page, SENHA)
             resultado = {
-                "autenticado": autenticado,
                 "url_final": page.url,
                 "html": page.content()[:5000],
                 "screenshot": base64.b64encode(page.screenshot(full_page=True)).decode()
@@ -87,15 +85,11 @@ def login():
             return jsonify(resultado)
         except Exception as e:
             try:
-                screenshot = base64.b64encode(page.screenshot(full_page=True)).decode()
+                sc = base64.b64encode(page.screenshot(full_page=True)).decode()
             except Exception:
-                screenshot = None
+                sc = None
             browser.close()
-            return jsonify({
-                "erro": str(e),
-                "url": page.url,
-                "screenshot": screenshot
-            }), 500
+            return jsonify({"erro": str(e), "url": page.url, "screenshot": sc}), 500
 
 
 @app.route("/baixar", methods=["POST"])
@@ -109,21 +103,14 @@ def baixar():
     erros = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu",
-                  "--single-process","--no-zygote","--disable-setuid-sandbox",
-                  "--disable-extensions","--memory-pressure-off"]
-        )
+        browser = _launch_browser(p)
         context = browser.new_context(accept_downloads=True)
         page    = context.new_page()
 
         try:
-            autenticado = _do_login(page, SENHA)
-            if not autenticado:
-                browser.close()
-                return jsonify({"erro": "Falha no login Keycloak", "url": page.url}), 500
+            _do_login(page, SENHA)
 
+            # Navega para a NT
             url_nt = f"https://www.pje.jus.br/e-natjus/notaTecnica-dados.php?idNotaTecnica={nt}"
             page.goto(url_nt, timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
