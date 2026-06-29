@@ -10,48 +10,58 @@ def health():
 
 @app.route("/baixar", methods=["POST"])
 def baixar():
-    # Lê a senha aqui dentro, não no início do arquivo
     SENHA = os.environ.get("ENATJUS_SENHA", "")
     if not SENHA:
-        return jsonify({"erro": "Variável ENATJUS_SENHA não configurada no Railway"}), 500
+        return jsonify({"erro": "Variável ENATJUS_SENHA não configurada"}), 500
 
     nt = request.json.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
 
+    print(f"Iniciando download NT: {nt}", flush=True)
     pdfs = []
     erros = []
 
     with sync_playwright() as p:
+        print("Playwright iniciado", flush=True)
         browser = p.chromium.launch(
-    headless=True,
-    args=[
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--single-process",
-        "--no-zygote",
-        "--disable-setuid-sandbox"
-    ]
-)
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+                "--no-zygote",
+                "--disable-setuid-sandbox",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--memory-pressure-off"
+            ]
+        )
+        print("Browser aberto", flush=True)
         context = browser.new_context(accept_downloads=True)
         page = context.new_page()
 
         try:
-            page.goto("https://www.pje.jus.br/e-natjus/", timeout=30000)
-            page.wait_for_load_state("networkidle")
-            page.click("text=PDPJ", timeout=10000)
-            page.wait_for_load_state("networkidle")
+            print("Acessando e-NatJus...", flush=True)
+            page.goto("https://www.pje.jus.br/e-natjus/", timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+            print("Página carregada", flush=True)
+
+            page.click("text=PDPJ", timeout=15000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+            print("Clicou em PDPJ", flush=True)
+
             page.fill("input[name='username']", "83069925391")
             page.fill("input[name='password']", SENHA)
             page.click("button:has-text('Entrar')")
-            page.wait_for_load_state("networkidle")
+            page.wait_for_load_state("networkidle", timeout=30000)
+            print("Login realizado", flush=True)
 
-            page.goto(
-                f"https://www.pje.jus.br/e-natjus/notaTecnica-dados.php?idNotaTecnica={nt}",
-                timeout=30000
-            )
-            page.wait_for_load_state("networkidle")
+            url_nt = f"https://www.pje.jus.br/e-natjus/notaTecnica-dados.php?idNotaTecnica={nt}"
+            page.goto(url_nt, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+            print(f"NT {nt} carregada", flush=True)
 
             seletores = [
                 "a[href*='.pdf']",
@@ -63,35 +73,48 @@ def baixar():
             botoes = []
             for sel in seletores:
                 els = page.locator(sel)
-                for i in range(min(els.count(), 3)):
+                count = els.count()
+                print(f"Seletor '{sel}': {count} elementos", flush=True)
+                for i in range(min(count, 3)):
                     botoes.append(els.nth(i))
+
+            print(f"Total de botões PDF encontrados: {len(botoes)}", flush=True)
 
             for idx, botao in enumerate(botoes[:3]):
                 try:
-                    with context.expect_download(timeout=15000) as dl:
+                    print(f"Baixando PDF {idx+1}...", flush=True)
+                    with context.expect_download(timeout=30000) as dl:
                         botao.click()
                     download = dl.value
                     path = f"/tmp/nt_{nt}_{idx+1}.pdf"
                     download.save_as(path)
                     with open(path, "rb") as f:
-                        pdfs.append({
-                            "nome": f"NT_{nt}_arquivo_{idx+1}.pdf",
-                            "base64": base64.b64encode(f.read()).decode()
-                        })
-                    time.sleep(1)
+                        conteudo = f.read()
+                    pdfs.append({
+                        "nome": f"NT_{nt}_arquivo_{idx+1}.pdf",
+                        "base64": base64.b64encode(conteudo).decode()
+                    })
+                    print(f"PDF {idx+1} baixado: {len(conteudo)} bytes", flush=True)
+                    time.sleep(2)
                 except Exception as e:
+                    print(f"Erro PDF {idx+1}: {e}", flush=True)
                     erros.append(f"PDF {idx+1}: {str(e)}")
 
         except Exception as e:
+            print(f"Erro geral: {e}", flush=True)
             browser.close()
             return jsonify({"erro": str(e)}), 500
 
         browser.close()
+        print("Browser fechado", flush=True)
 
     if not pdfs:
         return jsonify({"erro": "Nenhum PDF baixado", "detalhes": erros}), 500
 
+    print(f"Concluído: {len(pdfs)} PDFs baixados", flush=True)
     return jsonify({"numeroNT": nt, "pdfs": pdfs, "avisos": erros})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Iniciando servidor na porta {port}", flush=True)
+    app.run(host="0.0.0.0", port=port)
