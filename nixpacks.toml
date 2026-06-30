@@ -1,0 +1,5 @@
+# Pacotes de SISTEMA adicionais para o OCR (Tesseract + idioma portugues).
+# Este arquivo é ADITIVO: ele só acrescenta apt packages na fase de setup.
+# NÃO substitui o build do Python nem o comando que instala o Playwright.
+[phases.setup]
+aptPkgs = ["tesseract-ocr", "tesseract-ocr-por"]
