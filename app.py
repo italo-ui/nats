@@ -436,15 +436,23 @@ def processar():
                     pass
                 return jsonify({"erro": str(e), "numeroNT": nt}), 500
 
-    # baixa e extrai texto de cada PDF (fora do navegador, leve)
+# baixa e extrai texto de cada PDF (fora do navegador, leve)
     texto_total = ""
     arquivos = 0
+    paginas_total = 0
+    paginas_ilegiveis = 0
+    MIN_CHARS_POR_PAGINA = 100  # abaixo disso, página é considerada ilegível
+
     for info in hashes_validos[:5]:
         try:
             conteudo, content_type = _baixar_arquivo(info["hash"], cookies)
             with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
                 for pg in pdf.pages:
-                    texto_total += (pg.extract_text() or "") + "\n"
+                    txt_pagina = pg.extract_text() or ""
+                    paginas_total += 1
+                    if len(txt_pagina.strip()) < MIN_CHARS_POR_PAGINA:
+                        paginas_ilegiveis += 1
+                    texto_total += txt_pagina + "\n"
             texto_total += "\n--- fim do documento ---\n\n"
             arquivos += 1
         except Exception as e:
@@ -452,15 +460,29 @@ def processar():
 
     texto_total = texto_total.strip()
 
-    if not texto_total:
-        return jsonify({"erro": "Nenhum texto extraído (PDF pode ser imagem escaneada)",
-                        "numeroNT": nt}), 422
+    # calcula o quão legível foi o conjunto
+    if paginas_total > 0:
+        pct_ilegivel = round(100 * paginas_ilegiveis / paginas_total)
+    else:
+        pct_ilegivel = 100
+
+    # veredito de legibilidade
+    if pct_ilegivel >= 70:
+        legibilidade = "ilegivel"      # maioria das páginas sem texto
+    elif pct_ilegivel >= 30:
+        legibilidade = "parcial"       # boa parte comprometida
+    else:
+        legibilidade = "ok"            # legível o suficiente
 
     return jsonify({
         "numeroNT": nt,
         "texto": texto_total,
         "caracteres": len(texto_total),
-        "arquivos": arquivos
+        "arquivos": arquivos,
+        "paginas_total": paginas_total,
+        "paginas_ilegiveis": paginas_ilegiveis,
+        "pct_ilegivel": pct_ilegivel,
+        "legibilidade": legibilidade
     })
     
     
