@@ -586,6 +586,15 @@ def processar():
 
     texto_total = texto_total.strip()
 
+    # links diretos de download de cada arquivo no e-NatJus (sem trazer o PDF pro n8n)
+    arquivos_links = [
+        {
+            "nome": (h.get("nome") or ("Arquivo " + str(i + 1))),
+            "url": ENATJUS_BASE + "/arquivo-download.php?hash=" + h["hash"],
+        }
+        for i, h in enumerate(hashes_validos[:5])
+    ]
+
     if paginas_total > 0:
         pct_ilegivel = round(100 * paginas_ilegiveis / paginas_total)
     else:
@@ -607,7 +616,8 @@ def processar():
         "paginas_ilegiveis": paginas_ilegiveis,
         "paginas_ocr": paginas_ocr,
         "pct_ilegivel": pct_ilegivel,
-        "legibilidade": legibilidade
+        "legibilidade": legibilidade,
+        "arquivos_links": arquivos_links
     })
 
 
