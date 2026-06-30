@@ -390,11 +390,19 @@ def baixar():
 @app.route("/listar", methods=["GET"])
 def listar():
     """
-    Lista TODAS as NTs que aparecem na página de listagem do e-NatJus.
-    O n8n compara com a planilha e insere só as novas.
-    Use /listar?debug=1 para ver a estrutura bruta das linhas (calibração).
+    Lista as NTs da página de listagem do e-NatJus, com campos já separados.
+    Por padrão devolve só as 'Aguardando análise' (as que precisam de parecer).
+    Parâmetros opcionais:
+      ?todos=1  -> devolve também as já emitidas
+      ?debug=1  -> inclui as células brutas de cada linha
     """
+    apenas_pendentes = request.args.get("todos") != "1"
     debug = request.args.get("debug") == "1"
+
+    # padrões para achar campos por formato (à prova de desalinhamento)
+    re_nt        = re.compile(r"\b(\d{6})\b")
+    re_processo  = re.compile(r"\b(\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4})\b")
+    re_data_hora = re.compile(r"\b(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})\b")
 
     with sync_playwright() as p:
         browser = _launch_browser(p)
@@ -418,7 +426,7 @@ def listar():
             linhas = page.locator("table tr")
             total  = linhas.count()
 
-            nts, raw_rows = [], []
+            nts = []
             for i in range(total):
                 try:
                     texto = linhas.nth(i).inner_text().strip()
@@ -428,18 +436,62 @@ def listar():
                     continue
 
                 celulas = [c.strip() for c in re.split(r"[\t\n]+", texto) if c.strip()]
-                raw_rows.append(celulas)
 
-                achados = re.findall(r"\b(\d{6})\b", texto)
-                if achados:
-                    nts.append({"numero_nt": achados[0], "celulas": celulas})
+                m_nt = re_nt.search(texto)
+                if not m_nt:
+                    continue  # ignora cabeçalho, calendário e lixo
+
+                numero_nt    = m_nt.group(1)
+                m_proc       = re_processo.search(texto)
+                m_data       = re_data_hora.search(texto)
+                numero_proc  = m_proc.group(1) if m_proc else ""
+                data_solic   = m_data.group(1) if m_data else ""
+
+                # status: procura pelos textos conhecidos
+                if "Nota T" in texto and "emitida" in texto:
+                    status_site = "Nota Técnica emitida"
+                elif "Aguardando" in texto:
+                    status_site = "Aguardando análise"
+                else:
+                    status_site = ""
+
+                # vara/solicitante: a célula que contém 'Vara', 'Comarca',
+                # 'Núcleo' ou 'Juizado' (não depende de posição fixa)
+                vara = ""
+                for c in celulas:
+                    if any(k in c for k in ["Vara", "Comarca", "Núcleo", "Juizado", "Turma"]):
+                        vara = c
+                        break
+
+                # paciente: a célula logo após a data/hora, em letras maiúsculas
+                paciente = ""
+                for idx, c in enumerate(celulas):
+                    if re_data_hora.search(c) and idx + 1 < len(celulas):
+                        paciente = celulas[idx + 1]
+                        break
+
+                # doença rara: só 'Sim' conta; ausência ou 'Não' = não
+                doenca_rara = "Sim" if "\tSim\t" in ("\t" + "\t".join(celulas) + "\t") else "Não"
+
+                registro = {
+                    "numero_nt": numero_nt,
+                    "data_solicitacao": data_solic,
+                    "paciente": paciente,
+                    "numero_processo": numero_proc,
+                    "vara": vara,
+                    "status_site": status_site,
+                    "doenca_rara": doenca_rara,
+                }
+                if debug:
+                    registro["celulas"] = celulas
+
+                if apenas_pendentes and status_site != "Aguardando análise":
+                    continue
+
+                nts.append(registro)
 
             browser.close()
-
-            resposta = {"total_linhas": total, "total_nts": len(nts), "nts": nts}
-            if debug:
-                resposta["raw_rows"] = raw_rows[:50]
-            return jsonify(resposta)
+            return jsonify({"total_nts": len(nts), "nts": nts})
 
         except Exception as e:
             sc = _screenshot_b64(page)
