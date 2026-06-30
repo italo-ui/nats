@@ -1,4 +1,15 @@
 import os, time, base64, json, subprocess, urllib.request, urllib.error, re
+import io
+try:
+    import fitz  # PyMuPDF (rasteriza paginas para OCR; pip puro, sem libs de sistema)
+except Exception:
+    fitz = None
+try:
+    import pytesseract
+    from PIL import Image
+except Exception:
+    pytesseract = None
+    Image = None
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 
@@ -205,7 +216,6 @@ def _navegar_ate_formulario(context, page, nt):
     """
     pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
 
-    # Tenta clicar no botão de preencher/elaborar nota
     for seletor in [
         "a:has-text('Preencher')",
         "a:has-text('Elaborar')",
@@ -224,7 +234,6 @@ def _navegar_ate_formulario(context, page, nt):
         except Exception:
             pass
 
-    # Se não abriu nova aba, tenta na mesma página
     for seletor in [
         "a:has-text('Preencher')",
         "a:has-text('Elaborar')",
@@ -324,6 +333,7 @@ def diagnostico(nt):
 
 @app.route("/baixar", methods=["POST"])
 def baixar():
+    """(LEGADO) Baixa o PDF e devolve base64. Substituído por /processar."""
     nt = request.json.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
@@ -390,12 +400,32 @@ def baixar():
     })
 
 
+def _texto_ruim(t):
+    """True se o texto da pagina parece ilegivel: vazio, poucos caracteres, ou lixo de fonte (cid)."""
+    if not t or len(t.strip()) < 100:
+        return True
+    cid = t.count("(cid:")
+    letras = sum(1 for c in t if c.isalpha())
+    ratio = letras / max(len(t), 1)
+    return cid > 20 or ratio < 0.5
+
+
+def _ocr_pagina(doc_fitz, indice, dpi=200):
+    """Renderiza uma pagina do PDF e roda OCR em portugues via Tesseract."""
+    if fitz is None or pytesseract is None or Image is None:
+        return ""
+    page = doc_fitz.load_page(indice)
+    pix = page.get_pixmap(dpi=dpi)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    return pytesseract.image_to_string(img, lang="por") or ""
+
+
 @app.route("/processar", methods=["POST"])
 def processar():
     """
-    Baixa o PDF da NT E extrai o texto, tudo internamente.
+    [PRINCIPAL] Baixa o PDF da NT E extrai o texto, tudo internamente.
     Devolve SÓ o texto (leve) — o n8n nunca recebe o arquivo pesado.
-    Isso evita estouro de memória no n8n.
+    Mede a legibilidade (ok / parcial / ilegivel) para a triagem decidir.
     """
     import io
     try:
@@ -436,23 +466,48 @@ def processar():
                     pass
                 return jsonify({"erro": str(e), "numeroNT": nt}), 500
 
-# baixa e extrai texto de cada PDF (fora do navegador, leve)
+    # baixa e extrai texto de cada PDF; faz OCR das paginas escaneadas/ilegiveis
     texto_total = ""
     arquivos = 0
     paginas_total = 0
     paginas_ilegiveis = 0
-    MIN_CHARS_POR_PAGINA = 100  # abaixo disso, página é considerada ilegível
+    paginas_ocr = 0
+    MAX_PAGINAS_OCR = 40  # teto de seguranca para nao estourar o tempo de execucao
 
     for info in hashes_validos[:5]:
         try:
             conteudo, content_type = _baixar_arquivo(info["hash"], cookies)
+
+            # 1) tenta o texto nativo (rapido) com pdfplumber
+            textos = []
             with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
                 for pg in pdf.pages:
-                    txt_pagina = pg.extract_text() or ""
-                    paginas_total += 1
-                    if len(txt_pagina.strip()) < MIN_CHARS_POR_PAGINA:
+                    textos.append(pg.extract_text() or "")
+
+            # 2) para cada pagina ruim, faz OCR (PyMuPDF rasteriza + Tesseract le)
+            doc_fitz = None
+            for i, txt_pagina in enumerate(textos):
+                paginas_total += 1
+                if _texto_ruim(txt_pagina):
+                    txt_ocr = ""
+                    if paginas_ocr < MAX_PAGINAS_OCR and fitz is not None:
+                        try:
+                            if doc_fitz is None:
+                                doc_fitz = fitz.open(stream=conteudo, filetype="pdf")
+                            txt_ocr = _ocr_pagina(doc_fitz, i)
+                            paginas_ocr += 1
+                        except Exception:
+                            txt_ocr = ""
+                    if _texto_ruim(txt_ocr):
                         paginas_ilegiveis += 1
+                        texto_total += (txt_ocr or txt_pagina) + "\n"
+                    else:
+                        texto_total += txt_ocr + "\n"
+                else:
                     texto_total += txt_pagina + "\n"
+            if doc_fitz is not None:
+                doc_fitz.close()
+
             texto_total += "\n--- fim do documento ---\n\n"
             arquivos += 1
         except Exception as e:
@@ -460,19 +515,17 @@ def processar():
 
     texto_total = texto_total.strip()
 
-    # calcula o quão legível foi o conjunto
     if paginas_total > 0:
         pct_ilegivel = round(100 * paginas_ilegiveis / paginas_total)
     else:
         pct_ilegivel = 100
 
-    # veredito de legibilidade
     if pct_ilegivel >= 70:
-        legibilidade = "ilegivel"      # maioria das páginas sem texto
+        legibilidade = "ilegivel"
     elif pct_ilegivel >= 30:
-        legibilidade = "parcial"       # boa parte comprometida
+        legibilidade = "parcial"
     else:
-        legibilidade = "ok"            # legível o suficiente
+        legibilidade = "ok"
 
     return jsonify({
         "numeroNT": nt,
@@ -481,11 +534,12 @@ def processar():
         "arquivos": arquivos,
         "paginas_total": paginas_total,
         "paginas_ilegiveis": paginas_ilegiveis,
+        "paginas_ocr": paginas_ocr,
         "pct_ilegivel": pct_ilegivel,
         "legibilidade": legibilidade
     })
-    
-    
+
+
 @app.route("/listar", methods=["GET"])
 def listar():
     """
@@ -498,7 +552,6 @@ def listar():
     apenas_pendentes = request.args.get("todos") != "1"
     debug = request.args.get("debug") == "1"
 
-    # padrões para achar campos por formato (à prova de desalinhamento)
     re_nt        = re.compile(r"\b(\d{6})\b")
     re_processo  = re.compile(r"\b(\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4})\b")
     re_data_hora = re.compile(r"\b(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})\b")
@@ -538,7 +591,7 @@ def listar():
 
                 m_nt = re_nt.search(texto)
                 if not m_nt:
-                    continue  # ignora cabeçalho, calendário e lixo
+                    continue
 
                 numero_nt    = m_nt.group(1)
                 m_proc       = re_processo.search(texto)
@@ -546,7 +599,6 @@ def listar():
                 numero_proc  = m_proc.group(1) if m_proc else ""
                 data_solic   = m_data.group(1) if m_data else ""
 
-                # status: procura pelos textos conhecidos
                 if "Nota T" in texto and "emitida" in texto:
                     status_site = "Nota Técnica emitida"
                 elif "Aguardando" in texto:
@@ -554,22 +606,18 @@ def listar():
                 else:
                     status_site = ""
 
-                # vara/solicitante: a célula que contém 'Vara', 'Comarca',
-                # 'Núcleo' ou 'Juizado' (não depende de posição fixa)
                 vara = ""
                 for c in celulas:
                     if any(k in c for k in ["Vara", "Comarca", "Núcleo", "Juizado", "Turma"]):
                         vara = c
                         break
 
-                # paciente: a célula logo após a data/hora, em letras maiúsculas
                 paciente = ""
                 for idx, c in enumerate(celulas):
                     if re_data_hora.search(c) and idx + 1 < len(celulas):
                         paciente = celulas[idx + 1]
                         break
 
-                # doença rara: só 'Sim' conta; ausência ou 'Não' = não
                 doenca_rara = "Sim" if "\tSim\t" in ("\t" + "\t".join(celulas) + "\t") else "Não"
 
                 registro = {
@@ -600,38 +648,16 @@ def listar():
                 pass
             return jsonify({"erro": str(e), "screenshot": sc}), 500
 
+
 # ─────────────────────────────────────────────
-# Rota nova — preenche o formulário da NT
+# Rota [FASE 2] — preenche o formulário da NT (sem submeter)
 # ─────────────────────────────────────────────
 
 @app.route("/preencher", methods=["POST"])
 def preencher():
     """
     Preenche o formulário da NT no e-NatJus sem submeter.
-    
-    Payload esperado:
-    {
-      "numeroNT": "534540",
-      "cid": "M16.1",
-      "diagnostico": "Coxartrose primária unilateral",
-      "meios_confirmatorios": "Radiografia de quadril com laudo...",
-      "tipo_tecnologia": "Procedimento",  // Medicamento | Procedimento | Produto
-      "outras_tecnologias": "Fisioterapia, infiltração articular...",
-      "custo_tecnologia": "R$ 15.000,00 conforme orçamento...",
-      "fonte_custo": "Orçamento hospitalar datado de...",
-      "evidencias": "Estudos clínicos demonstram...",
-      "beneficio_esperado": "Alívio da dor e recuperação funcional...",
-      "recomendacao_conitec": "Não avaliada",  // Recomendada | Não Recomendada | Não avaliada
-      "conclusao_favoravel": "Favorável",  // Favorável | Não favorável
-      "conclusao": "Com base nas evidências apresentadas...",
-      "ha_evidencias": "Sim",  // Sim | Não | Não se aplica
-      "urgencia": "Não",  // Sim | Não
-      "referencias": "AUTOR, Nome. Título. Revista, ano...",
-      "natjus_responsavel": "CE",
-      "instituicao_responsavel": "TJCE",
-      "apoio_tutoria": "Não",  // Sim | Não
-      "outras_informacoes": "Questionário do juiz: ..."
-    }
+    [FASE 2 — seletores precisam ser calibrados antes do uso real]
     """
     dados = request.json
     nt = dados.get("numeroNT")
@@ -652,78 +678,55 @@ def preencher():
                 browser.close()
                 return jsonify({"erro": "Nenhum cookie configurado."}), 500
 
-            # Navega até o formulário
             formulario = _navegar_ate_formulario(context, page, nt)
             log.append("Formulário localizado")
 
-            # ── Diagnóstico Principal ──
             if dados.get("cid"):
                 ok = _preencher_campo(formulario, "input[name*='cid'], #cid, input[placeholder*='CID']", dados["cid"])
                 log.append(f"CID: {'OK' if ok else 'FALHOU'}")
-
             if dados.get("diagnostico"):
                 ok = _preencher_campo(formulario, "textarea[name*='diagnostico'], #diagnostico", dados["diagnostico"])
                 log.append(f"Diagnóstico: {'OK' if ok else 'FALHOU'}")
-
             if dados.get("meios_confirmatorios"):
                 ok = _preencher_campo(formulario, "textarea[name*='meios'], textarea[name*='confirmatorio']", dados["meios_confirmatorios"])
                 log.append(f"Meios confirmatórios: {'OK' if ok else 'FALHOU'}")
-
-            # ── Descrição da Tecnologia ──
             if dados.get("tipo_tecnologia"):
                 ok = _selecionar_opcao(formulario, "select[name*='tipo'], #tipo_tecnologia", dados["tipo_tecnologia"])
                 log.append(f"Tipo de tecnologia: {'OK' if ok else 'FALHOU'}")
-
-            # ── Outras Tecnologias ──
             if dados.get("outras_tecnologias"):
                 ok = _preencher_campo(formulario, "textarea[name*='outras_tecnologias'], textarea[name*='alternativas']", dados["outras_tecnologias"])
                 log.append(f"Outras tecnologias: {'OK' if ok else 'FALHOU'}")
-
-            # ── Custo ──
             if dados.get("custo_tecnologia"):
                 ok = _preencher_campo(formulario, "textarea[name*='custo']", dados["custo_tecnologia"])
                 log.append(f"Custo: {'OK' if ok else 'FALHOU'}")
-
             if dados.get("fonte_custo"):
                 ok = _preencher_campo(formulario, "textarea[name*='fonte']", dados["fonte_custo"])
                 log.append(f"Fonte do custo: {'OK' if ok else 'FALHOU'}")
-
-            # ── Evidências ──
             if dados.get("evidencias"):
                 ok = _preencher_campo(formulario, "textarea[name*='evidencia'], textarea[name*='eficacia']", dados["evidencias"])
                 log.append(f"Evidências: {'OK' if ok else 'FALHOU'}")
-
             if dados.get("beneficio_esperado"):
                 ok = _preencher_campo(formulario, "textarea[name*='beneficio'], textarea[name*='resultado']", dados["beneficio_esperado"])
                 log.append(f"Benefício esperado: {'OK' if ok else 'FALHOU'}")
-
             if dados.get("recomendacao_conitec"):
                 ok = _selecionar_opcao(formulario, "select[name*='conitec'], select[name*='recomendacao']", dados["recomendacao_conitec"])
                 log.append(f"Recomendação CONITEC: {'OK' if ok else 'FALHOU'}")
-
-            # ── Conclusão ──
             if dados.get("conclusao_favoravel"):
                 ok = _selecionar_opcao(formulario, "select[name*='favoravel'], select[name*='conclusao_select']", dados["conclusao_favoravel"])
                 log.append(f"Conclusão (favorável/não): {'OK' if ok else 'FALHOU'}")
-
             if dados.get("conclusao"):
                 ok = _preencher_campo(formulario, "textarea[name*='conclusao']", dados["conclusao"])
                 log.append(f"Conclusão (texto): {'OK' if ok else 'FALHOU'}")
-
             if dados.get("ha_evidencias"):
                 ok = _selecionar_opcao(formulario, "select[name*='evidencias_select'], select[name*='ha_evidencia']", dados["ha_evidencias"])
                 log.append(f"Há evidências: {'OK' if ok else 'FALHOU'}")
-
             if dados.get("urgencia"):
                 ok = _selecionar_opcao(formulario, "select[name*='urgencia']", dados["urgencia"])
                 log.append(f"Urgência: {'OK' if ok else 'FALHOU'}")
-
-            # ── Referências ──
             if dados.get("referencias"):
                 ok = _preencher_campo(formulario, "textarea[name*='referencia'], textarea[name*='bibliograf']", dados["referencias"])
                 log.append(f"Referências: {'OK' if ok else 'FALHOU'}")
 
-            # ── Responsável ──
             natjus = dados.get("natjus_responsavel", "CE")
             ok = _selecionar_opcao(formulario, "select[name*='natjus'], select[name*='responsavel']", natjus)
             log.append(f"NatJus responsável ({natjus}): {'OK' if ok else 'FALHOU'}")
@@ -740,18 +743,11 @@ def preencher():
                 ok = _preencher_campo(formulario, "textarea[name*='outras_info'], textarea[name*='outras_informacoes']", dados["outras_informacoes"])
                 log.append(f"Outras informações: {'OK' if ok else 'FALHOU'}")
 
-            # Screenshot final sem submeter
             screenshot_final = _screenshot_b64(formulario)
             log.append("Formulário preenchido — NÃO submetido (aguardando aprovação manual)")
 
             browser.close()
-
-            return jsonify({
-                "sucesso": True,
-                "numeroNT": nt,
-                "log": log,
-                "screenshot": screenshot_final
-            })
+            return jsonify({"sucesso": True, "numeroNT": nt, "log": log, "screenshot": screenshot_final})
 
         except Exception as e:
             sc = _screenshot_b64(page)
@@ -759,29 +755,16 @@ def preencher():
                 browser.close()
             except Exception:
                 pass
-            return jsonify({
-                "erro": str(e),
-                "log": log,
-                "screenshot": sc
-            }), 500
+            return jsonify({"erro": str(e), "log": log, "screenshot": sc}), 500
 
 
 # ─────────────────────────────────────────────
-# Rota nova — extrai texto do PDF
+# Rota [LEGADO] — extrai texto de um PDF em base64
 # ─────────────────────────────────────────────
 
 @app.route("/comprimir", methods=["POST"])
 def comprimir():
-    """
-    Extrai o texto de um PDF em base64 e retorna como texto puro.
-    Isso reduz o payload de ~4MB para poucos KB antes de enviar ao Claude.
-
-    Payload esperado:
-    {
-      "pdfBase64": "...",
-      "numeroNT": "534540"
-    }
-    """
+    """(LEGADO) Extrai texto de um PDF base64. Hoje /processar já faz isso interno."""
     try:
         import io
         try:
