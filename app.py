@@ -464,7 +464,7 @@ def processar():
     })
     
     
-    @app.route("/listar", methods=["GET"])
+@app.route("/listar", methods=["GET"])
 def listar():
     """
     Lista as NTs da página de listagem do e-NatJus, com campos já separados.
