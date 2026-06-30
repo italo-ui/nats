@@ -390,7 +390,81 @@ def baixar():
     })
 
 
-@app.route("/listar", methods=["GET"])
+@app.route("/processar", methods=["POST"])
+def processar():
+    """
+    Baixa o PDF da NT E extrai o texto, tudo internamente.
+    Devolve SÓ o texto (leve) — o n8n nunca recebe o arquivo pesado.
+    Isso evita estouro de memória no n8n.
+    """
+    import io
+    try:
+        import pdfplumber
+    except ImportError:
+        subprocess.run(["pip", "install", "pdfplumber", "-q"], check=True)
+        import pdfplumber
+
+    nt = request.json.get("numeroNT")
+    if not nt:
+        return jsonify({"erro": "numeroNT obrigatorio"}), 400
+
+    with _lock_navegador:
+        with sync_playwright() as p:
+            browser = _launch_browser(p)
+            context = browser.new_context(accept_downloads=True)
+            page    = context.new_page()
+            try:
+                n_cookies = _inject_cookies(context)
+                if n_cookies == 0:
+                    browser.close()
+                    return jsonify({"erro": "Nenhum cookie configurado"}), 500
+
+                pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
+                hashes    = _extrair_hashes(pagina_nt)
+                hashes_validos = [h for h in hashes if "hash" in h and h["hash"]]
+
+                if not hashes_validos:
+                    browser.close()
+                    return jsonify({"erro": "Nenhum anexo encontrado na NT", "numeroNT": nt}), 404
+
+                cookies = _cookie_str(context)
+                browser.close()
+            except Exception as e:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                return jsonify({"erro": str(e), "numeroNT": nt}), 500
+
+    # baixa e extrai texto de cada PDF (fora do navegador, leve)
+    texto_total = ""
+    arquivos = 0
+    for info in hashes_validos[:5]:
+        try:
+            conteudo, content_type = _baixar_arquivo(info["hash"], cookies)
+            with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
+                for pg in pdf.pages:
+                    texto_total += (pg.extract_text() or "") + "\n"
+            texto_total += "\n--- fim do documento ---\n\n"
+            arquivos += 1
+        except Exception as e:
+            texto_total += f"\n[erro ao ler arquivo: {e}]\n"
+
+    texto_total = texto_total.strip()
+
+    if not texto_total:
+        return jsonify({"erro": "Nenhum texto extraído (PDF pode ser imagem escaneada)",
+                        "numeroNT": nt}), 422
+
+    return jsonify({
+        "numeroNT": nt,
+        "texto": texto_total,
+        "caracteres": len(texto_total),
+        "arquivos": arquivos
+    })
+    
+    
+    @app.route("/listar", methods=["GET"])
 def listar():
     """
     Lista as NTs da página de listagem do e-NatJus, com campos já separados.
