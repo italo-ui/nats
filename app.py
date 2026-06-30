@@ -1,7 +1,7 @@
 import os, time, base64, json, subprocess, urllib.request, urllib.error, re
 import io
 try:
-    import fitz  # PyMuPDF (rasteriza paginas para OCR; pip puro, sem libs de sistema)
+    import fitz  # PyMuPDF (rasteriza paginas; pip puro, sem libs de sistema)
 except Exception:
     fitz = None
 try:
@@ -150,24 +150,44 @@ def _navegar_ate_pagina_nt(context, page, nt):
 
 
 def _extrair_hashes(pagina_nt):
+    """Le os hashes dos arquivos da NT.
+    Metodo principal: links visiveis de download (<a href="arquivo-download.php?hash=...">).
+    Fallback: inputs escondidos do formulario (input.fileform).
+    """
     hashes = []
     try:
-        inputs = pagina_nt.locator("input.fileform")
-        nomes  = pagina_nt.locator("input.filename")
-
-        for i in range(inputs.count()):
-            try:
-                hash_val = inputs.nth(i).get_attribute("value") or ""
-                nome_val = ""
+        # 1) links de download visiveis (pega TODOS os arquivos da NT)
+        try:
+            links = pagina_nt.locator("a[href*='arquivo-download.php?hash=']")
+            for i in range(links.count()):
                 try:
-                    nome_val = nomes.nth(i).get_attribute("value") or ""
+                    href = links.nth(i).get_attribute("href") or ""
+                    m = re.search(r"hash=([A-Za-z0-9]+)", href)
+                    if m:
+                        h = m.group(1).strip()
+                        if h and not any(x.get("hash") == h for x in hashes):
+                            hashes.append({"hash": h, "nome": ""})
                 except Exception:
                     pass
+        except Exception:
+            pass
 
-                if hash_val.strip():
-                    hashes.append({"hash": hash_val.strip(), "nome": nome_val.strip()})
-            except Exception:
-                pass
+        # 2) fallback: inputs escondidos do formulario
+        if not hashes:
+            inputs = pagina_nt.locator("input.fileform")
+            nomes  = pagina_nt.locator("input.filename")
+            for i in range(inputs.count()):
+                try:
+                    hash_val = inputs.nth(i).get_attribute("value") or ""
+                    nome_val = ""
+                    try:
+                        nome_val = nomes.nth(i).get_attribute("value") or ""
+                    except Exception:
+                        pass
+                    if hash_val.strip():
+                        hashes.append({"hash": hash_val.strip(), "nome": nome_val.strip()})
+                except Exception:
+                    pass
     except Exception as e:
         hashes.append({"erro": str(e)})
 
@@ -401,7 +421,7 @@ def baixar():
 
 
 def _texto_ruim(t):
-    """True se o texto da pagina parece ilegivel: vazio, poucos caracteres, ou lixo de fonte (cid)."""
+    """True se o texto da pagina parece ilegivel: vazio, poucos chars ou lixo de fonte (cid)."""
     if not t or len(t.strip()) < 100:
         return True
     cid = t.count("(cid:")
@@ -410,14 +430,52 @@ def _texto_ruim(t):
     return cid > 20 or ratio < 0.5
 
 
-def _ocr_pagina(doc_fitz, indice, dpi=200):
-    """Renderiza uma pagina do PDF e roda OCR em portugues via Tesseract."""
+def _otsu_threshold(hist):
+    """Limiar de Otsu (binarizacao) a partir do histograma de cinza, em Python puro."""
+    total = sum(hist)
+    if total == 0:
+        return 127
+    soma_total = sum(i * hist[i] for i in range(256))
+    soma_b = 0.0
+    peso_b = 0
+    max_var = -1.0
+    limiar = 127
+    for i in range(256):
+        peso_b += hist[i]
+        if peso_b == 0:
+            continue
+        peso_f = total - peso_b
+        if peso_f == 0:
+            break
+        soma_b += i * hist[i]
+        media_b = soma_b / peso_b
+        media_f = (soma_total - soma_b) / peso_f
+        var = peso_b * peso_f * (media_b - media_f) ** 2
+        if var > max_var:
+            max_var = var
+            limiar = i
+    return limiar
+
+
+def _preprocess(img):
+    """Cinza + binarizacao (Otsu): o Tesseract le muito melhor preto-no-branco."""
+    g = img.convert("L")
+    try:
+        thr = _otsu_threshold(g.histogram()[:256])
+        return g.point(lambda p: 255 if p > thr else 0)
+    except Exception:
+        return g
+
+
+def _ocr_pagina(doc_fitz, indice, dpi=300):
+    """Renderiza a pagina em alta resolucao, pre-processa e roda OCR (portugues)."""
     if fitz is None or pytesseract is None or Image is None:
         return ""
     page = doc_fitz.load_page(indice)
     pix = page.get_pixmap(dpi=dpi)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
-    return pytesseract.image_to_string(img, lang="por") or ""
+    img = _preprocess(img)
+    return pytesseract.image_to_string(img, lang="por", config="--oem 1 --psm 6") or ""
 
 
 @app.route("/processar", methods=["POST"])
@@ -466,31 +524,44 @@ def processar():
                     pass
                 return jsonify({"erro": str(e), "numeroNT": nt}), 500
 
-    # baixa e extrai texto de cada PDF; faz OCR das paginas escaneadas/ilegiveis
+    # baixa todos os arquivos; usa texto nativo (pdfplumber) onde der e faz OCR
+    # SELETIVO so nas paginas escaneadas, com orcamento de tempo e de paginas.
+    # Processa do menor para o maior (laudo/relatorio costuma ser o arquivo menor).
     texto_total = ""
     arquivos = 0
     paginas_total = 0
     paginas_ilegiveis = 0
     paginas_ocr = 0
-    MAX_PAGINAS_OCR = 40  # teto de seguranca para nao estourar o tempo de execucao
+    MAX_PAGINAS_OCR = 30      # teto de paginas que farao OCR
+    OCR_TIME_BUDGET = 150     # segundos: para de fazer OCR depois disso (margem p/ timeout)
+    t_inicio = time.time()
 
-    for info in hashes_validos[:5]:
+    # 1) baixa o conteudo de cada arquivo
+    baixados = []
+    for idx, info in enumerate(hashes_validos[:5]):
         try:
-            conteudo, content_type = _baixar_arquivo(info["hash"], cookies)
+            conteudo, _ct = _baixar_arquivo(info["hash"], cookies)
+            baixados.append((idx, conteudo))
+        except Exception as e:
+            texto_total += f"\n[erro ao baixar arquivo {idx+1}: {e}]\n"
 
-            # 1) tenta o texto nativo (rapido) com pdfplumber
+    # 2) menor -> maior (gasta o orcamento de OCR nos arquivos menores primeiro)
+    baixados.sort(key=lambda x: len(x[1]))
+
+    for idx, conteudo in baixados:
+        try:
             textos = []
             with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
                 for pg in pdf.pages:
                     textos.append(pg.extract_text() or "")
 
-            # 2) para cada pagina ruim, faz OCR (PyMuPDF rasteriza + Tesseract le)
             doc_fitz = None
             for i, txt_pagina in enumerate(textos):
                 paginas_total += 1
                 if _texto_ruim(txt_pagina):
                     txt_ocr = ""
-                    if paginas_ocr < MAX_PAGINAS_OCR and fitz is not None:
+                    dentro_orcamento = (paginas_ocr < MAX_PAGINAS_OCR) and ((time.time() - t_inicio) < OCR_TIME_BUDGET)
+                    if dentro_orcamento and fitz is not None:
                         try:
                             if doc_fitz is None:
                                 doc_fitz = fitz.open(stream=conteudo, filetype="pdf")
