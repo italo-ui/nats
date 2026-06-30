@@ -3,6 +3,8 @@ from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 
 app = Flask(__name__)
+import threading
+_lock_navegador = threading.Lock()
 
 ENATJUS_BASE = "https://www.pje.jus.br/e-natjus"
 LOGIN_URL     = f"{ENATJUS_BASE}/index.php"
@@ -329,7 +331,8 @@ def baixar():
     pdfs  = []
     erros = []
 
-    with sync_playwright() as p:
+    with _lock_navegador:  # garante UM navegador por vez (evita estouro de memória)
+      with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context(accept_downloads=True)
         page    = context.new_page()
