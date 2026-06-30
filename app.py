@@ -1,4 +1,4 @@
-import os, time, base64, json, subprocess, urllib.request, urllib.error
+import os, time, base64, json, subprocess, urllib.request, urllib.error, re
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 
@@ -386,6 +386,68 @@ def baixar():
         "avisos": erros
     })
 
+
+@app.route("/listar", methods=["GET"])
+def listar():
+    """
+    Lista TODAS as NTs que aparecem na página de listagem do e-NatJus.
+    O n8n compara com a planilha e insere só as novas.
+    Use /listar?debug=1 para ver a estrutura bruta das linhas (calibração).
+    """
+    debug = request.args.get("debug") == "1"
+
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = browser.new_context()
+        page    = context.new_page()
+        try:
+            n_cookies = _inject_cookies(context)
+            if n_cookies == 0:
+                browser.close()
+                return jsonify({"erro": "Nenhum cookie configurado"}), 500
+
+            page.goto(LISTA_URL, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+
+            if not _check_logged_in(page):
+                sc = _screenshot_b64(page)
+                browser.close()
+                return jsonify({"erro": "Sessão expirada ou cookies inválidos",
+                                "screenshot": sc}), 401
+
+            linhas = page.locator("table tr")
+            total  = linhas.count()
+
+            nts, raw_rows = [], []
+            for i in range(total):
+                try:
+                    texto = linhas.nth(i).inner_text().strip()
+                except Exception:
+                    continue
+                if not texto:
+                    continue
+
+                celulas = [c.strip() for c in re.split(r"[\t\n]+", texto) if c.strip()]
+                raw_rows.append(celulas)
+
+                achados = re.findall(r"\b(\d{6})\b", texto)
+                if achados:
+                    nts.append({"numero_nt": achados[0], "celulas": celulas})
+
+            browser.close()
+
+            resposta = {"total_linhas": total, "total_nts": len(nts), "nts": nts}
+            if debug:
+                resposta["raw_rows"] = raw_rows[:50]
+            return jsonify(resposta)
+
+        except Exception as e:
+            sc = _screenshot_b64(page)
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return jsonify({"erro": str(e), "screenshot": sc}), 500
 
 # ─────────────────────────────────────────────
 # Rota nova — preenche o formulário da NT
