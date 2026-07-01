@@ -12,18 +12,188 @@ except Exception:
     Image = None
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
-
 app = Flask(__name__)
 import threading
 _lock_navegador = threading.Lock()
-
 ENATJUS_BASE = "https://www.pje.jus.br/e-natjus"
 LOGIN_URL     = f"{ENATJUS_BASE}/index.php"
 LISTA_URL     = f"{ENATJUS_BASE}/notaTecnica-solicitacao-listar.php"
 DADOS_URL     = f"{ENATJUS_BASE}/notaTecnica-dados.php?idNotaTecnica={{nt}}"
 DOWNLOAD_URL  = f"{ENATJUS_BASE}/arquivo-download.php?hash={{hash}}"
-
 COOKIES_JSON_ENV = "ENATJUS_COOKIES"
+
+# ============================================================
+# LOGIN AUTOMATICO — fim da renovacao manual de cookies
+# ------------------------------------------------------------
+# Variaveis de ambiente (Railway > Variables):
+#   ENATJUS_USER        login do e-NatJus
+#   ENATJUS_PASS        senha do e-NatJus
+#   COOKIE_STORE_PATH   opcional, ex.: /data/enatjus_cookies.json (Volume) -> mantem sessao entre deploys
+#   ENATJUS_SESSION_TTL opcional, segundos (default 1500 = 25 min)
+#   ENATJUS_COOKIES     opcional (modo legado): se NAO houver USER/PASS, usa estes cookies
+# Se ENATJUS_USER/ENATJUS_PASS estiverem definidos, o servico loga sozinho e
+# reautentica automaticamente quando a sessao expira. Caso contrario, cai no
+# modo legado (cookies do ENATJUS_COOKIES), preservando o comportamento antigo.
+# ============================================================
+ENATJUS_USER = os.environ.get("ENATJUS_USER", "")
+ENATJUS_PASS = os.environ.get("ENATJUS_PASS", "")
+COOKIE_STORE_PATH = os.environ.get("COOKIE_STORE_PATH", "")
+SESSION_TTL = int(os.environ.get("ENATJUS_SESSION_TTL", "1500"))
+
+_cookies_cache = None      # lista no formato context.cookies() do Playwright
+_cookies_ts = 0.0
+_cookies_lock = threading.Lock()
+
+
+def _persist_cookies(cookies):
+    if not COOKIE_STORE_PATH:
+        return
+    try:
+        with open(COOKIE_STORE_PATH, "w") as f:
+            json.dump({"ts": time.time(), "cookies": cookies}, f)
+    except Exception:
+        pass
+
+
+def _load_cookies_disk():
+    if not COOKIE_STORE_PATH or not os.path.exists(COOKIE_STORE_PATH):
+        return None
+    try:
+        with open(COOKIE_STORE_PATH) as f:
+            data = json.load(f)
+        if time.time() - float(data.get("ts", 0)) < SESSION_TTL:
+            return data.get("cookies")
+    except Exception:
+        pass
+    return None
+
+
+def _cookies_env_seed():
+    """Modo legado: converte ENATJUS_COOKIES (JSON do navegador) para o formato Playwright."""
+    raw = os.environ.get(COOKIES_JSON_ENV, "")
+    if not raw:
+        return None
+    try:
+        cookies = json.loads(raw)
+    except Exception:
+        return None
+    out = []
+    for c in cookies:
+        pc = {
+            "name":   c.get("name", ""),
+            "value":  c.get("value", ""),
+            "domain": c.get("domain", "www.pje.jus.br"),
+            "path":   c.get("path", "/"),
+        }
+        if "secure" in c:   pc["secure"]   = bool(c["secure"])
+        if "httpOnly" in c: pc["httpOnly"] = bool(c["httpOnly"])
+        ss = c.get("sameSite")
+        if isinstance(ss, str) and ss in ("Strict", "Lax", "None"):
+            pc["sameSite"] = ss
+        if "expirationDate" in c:
+            pc["expires"] = float(c["expirationDate"])
+        out.append(pc)
+    return out or None
+
+
+def _get_cached_cookies():
+    global _cookies_cache, _cookies_ts
+    with _cookies_lock:
+        if _cookies_cache and (time.time() - _cookies_ts) < SESSION_TTL:
+            return _cookies_cache
+        disk = _load_cookies_disk()
+        if disk:
+            _cookies_cache, _cookies_ts = disk, time.time()
+            return _cookies_cache
+        return None
+
+
+def _set_cached_cookies(cookies):
+    global _cookies_cache, _cookies_ts
+    if not cookies:
+        return
+    with _cookies_lock:
+        _cookies_cache, _cookies_ts = cookies, time.time()
+    _persist_cookies(cookies)
+
+
+def _invalidate_cookies():
+    global _cookies_cache, _cookies_ts
+    with _cookies_lock:
+        _cookies_cache, _cookies_ts = None, 0.0
+
+
+def _tem_credenciais():
+    return bool(ENATJUS_USER and ENATJUS_PASS)
+
+
+def _login_no_contexto(context, page):
+    """Faz login no e-NatJus DENTRO do contexto/navegador atual (sem abrir um segundo browser)."""
+    if not _tem_credenciais():
+        raise Exception("Login automatico indisponivel: defina ENATJUS_USER e ENATJUS_PASS")
+    page.goto(LOGIN_URL, timeout=60000)
+    page.wait_for_load_state("networkidle", timeout=30000)
+    if _check_logged_in(page):
+        _set_cached_cookies(context.cookies())
+        return
+    # Seletores confirmados em https://www.pje.jus.br/e-natjus/ (form id="formLogin").
+    # O token CSRF (input hidden name="token") ja vem preenchido pela pagina; nao mexer.
+    page.fill("#login", ENATJUS_USER)
+    page.fill("#senha", ENATJUS_PASS)
+    try:
+        page.click("#formLogin button[type=submit]", timeout=15000)  # botao "Entrar" -> login() via AJAX
+    except Exception:
+        try:
+            page.evaluate("typeof login === 'function' && login()")
+        except Exception:
+            pass
+    page.wait_for_load_state("networkidle", timeout=30000)
+    if not _check_logged_in(page):
+        time.sleep(2)
+        try:
+            page.goto(LISTA_URL, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except Exception:
+            pass
+    if not _check_logged_in(page):
+        raise Exception("Login automatico falhou (credenciais invalidas ou layout do e-NatJus mudou)")
+    _set_cached_cookies(context.cookies())
+
+
+def _exigir_sessao(context, page, forcar=False):
+    """
+    Garante uma sessao valida no contexto:
+      - injeta cookies em cache (rapido) quando possivel;
+      - senao, faz login automatico (se houver credenciais);
+      - modo legado: usa ENATJUS_COOKIES quando nao ha credenciais.
+    """
+    if not forcar:
+        cookies = _get_cached_cookies()
+        if not cookies and not _tem_credenciais():
+            cookies = _cookies_env_seed()
+        if cookies:
+            try:
+                context.add_cookies(cookies)
+                return
+            except Exception:
+                pass
+    if _tem_credenciais():
+        _login_no_contexto(context, page)
+    else:
+        seed = _cookies_env_seed()
+        if seed:
+            context.add_cookies(seed)
+        else:
+            raise Exception("Sem sessao: configure ENATJUS_USER/ENATJUS_PASS (login automatico) ou ENATJUS_COOKIES")
+
+
+def _relogar_se_possivel(context, page):
+    """Invalida o cache e refaz login no contexto atual. Retorna True se relogou."""
+    if _tem_credenciais():
+        _invalidate_cookies()
+        _login_no_contexto(context, page)
+        return True
+    return False
 
 
 def _launch_browser(p):
@@ -35,51 +205,18 @@ def _launch_browser(p):
             "--disable-extensions", "--memory-pressure-off"
         ]
     )
-
-
-def _inject_cookies(context):
-    raw = os.environ.get(COOKIES_JSON_ENV, "[]")
-    cookies = json.loads(raw)
-    playwright_cookies = []
-    for c in cookies:
-        pc = {
-            "name":   c.get("name", ""),
-            "value":  c.get("value", ""),
-            "domain": c.get("domain", "www.pje.jus.br"),
-            "path":   c.get("path", "/"),
-        }
-        if "secure" in c:   pc["secure"]   = bool(c["secure"])
-        if "httpOnly" in c: pc["httpOnly"] = bool(c["httpOnly"])
-        if "sameSite" in c:
-            ss = c["sameSite"]
-            if isinstance(ss, str) and ss in ("Strict", "Lax", "None"):
-                pc["sameSite"] = ss
-        if "expirationDate" in c:
-            pc["expires"] = float(c["expirationDate"])
-        playwright_cookies.append(pc)
-    if playwright_cookies:
-        context.add_cookies(playwright_cookies)
-    return len(playwright_cookies)
-
-
 def _check_logged_in(page):
     try:
         return "Login" not in page.inner_text("nav")
     except Exception:
         return False
-
-
 def _screenshot_b64(page):
     try:
         return base64.b64encode(page.screenshot(full_page=True)).decode()
     except Exception:
         return None
-
-
 def _cookie_str(context):
     return "; ".join(f"{c['name']}={c['value']}" for c in context.cookies())
-
-
 def _aguardar_conteudo(page):
     for seletor in [
         "input.fileform",
@@ -94,50 +231,46 @@ def _aguardar_conteudo(page):
         except Exception:
             pass
     time.sleep(5)
-
-
 def _navegar_direto(context, page, nt):
     url = DADOS_URL.format(nt=nt)
     page.goto(url, timeout=60000)
     page.wait_for_load_state("networkidle", timeout=30000)
-
     if not _check_logged_in(page):
-        raise Exception("Sessão expirada ou cookies inválidos")
-
+        # autocura: reloga uma vez e refaz a navegacao
+        if _relogar_se_possivel(context, page):
+            page.goto(url, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+        if not _check_logged_in(page):
+            raise Exception("Sessão expirada ou cookies inválidos")
     if "notaTecnica-solicitacao-listar" in page.url:
         raise Exception(f"NT {nt} não encontrada — redirecionado para listagem")
-
     _aguardar_conteudo(page)
     return page
-
-
 def _navegar_via_listagem(context, page, nt):
     page.goto(LISTA_URL, timeout=60000)
     page.wait_for_load_state("networkidle", timeout=30000)
-
     if not _check_logged_in(page):
-        raise Exception("Sessão expirada ou cookies inválidos")
-
+        # autocura: reloga uma vez e refaz a navegacao
+        if _relogar_se_possivel(context, page):
+            page.goto(LISTA_URL, timeout=60000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+        if not _check_logged_in(page):
+            raise Exception("Sessão expirada ou cookies inválidos")
     linha = page.locator(f"tr:has-text('{nt}')").first
     if linha.count() == 0:
         raise Exception(f"NT {nt} não encontrada na listagem")
-
     btn_acoes = linha.locator("button, a").filter(has_text="Ações").first
     if btn_acoes.count() == 0:
         btn_acoes = linha.locator(".dropdown-toggle, [data-toggle='dropdown']").first
     btn_acoes.click()
     time.sleep(1)
-
     opcao_nt = page.locator("a:has-text('Nota Técnica'), a:has-text('Nota Tecnica')").first
     with context.expect_page() as nova_aba_info:
         opcao_nt.click()
-
     pagina_nt = nova_aba_info.value
     pagina_nt.wait_for_load_state("networkidle", timeout=30000)
     _aguardar_conteudo(pagina_nt)
     return pagina_nt
-
-
 def _navegar_ate_pagina_nt(context, page, nt):
     try:
         return _navegar_direto(context, page, nt)
@@ -147,8 +280,6 @@ def _navegar_ate_pagina_nt(context, page, nt):
             return _navegar_via_listagem(context, page2, nt)
         except Exception as e2:
             raise Exception(f"Falha nas duas estratégias. Direto: {e1} | Listagem: {e2}")
-
-
 def _extrair_hashes(pagina_nt):
     """Le os hashes dos arquivos da NT.
     Metodo principal: links visiveis de download (<a href="arquivo-download.php?hash=...">).
@@ -171,7 +302,6 @@ def _extrair_hashes(pagina_nt):
                     pass
         except Exception:
             pass
-
         # 2) fallback: inputs escondidos do formulario
         if not hashes:
             inputs = pagina_nt.locator("input.fileform")
@@ -190,10 +320,7 @@ def _extrair_hashes(pagina_nt):
                     pass
     except Exception as e:
         hashes.append({"erro": str(e)})
-
     return hashes
-
-
 def _baixar_arquivo(hash_val, cookie_str):
     url = DOWNLOAD_URL.format(hash=hash_val)
     req = urllib.request.Request(url)
@@ -204,8 +331,6 @@ def _baixar_arquivo(hash_val, cookie_str):
         conteudo = resp.read()
         content_type = resp.headers.get("Content-Type", "")
     return conteudo, content_type
-
-
 def _selecionar_opcao(page, seletor, valor):
     """Seleciona uma opção em um <select> pelo valor ou texto visível."""
     try:
@@ -217,8 +342,6 @@ def _selecionar_opcao(page, seletor, valor):
             return True
         except Exception:
             return False
-
-
 def _preencher_campo(page, seletor, valor):
     """Preenche um campo de texto, limpando antes."""
     try:
@@ -227,15 +350,12 @@ def _preencher_campo(page, seletor, valor):
         return True
     except Exception:
         return False
-
-
 def _navegar_ate_formulario(context, page, nt):
     """
     Navega até a página da NT e clica no botão/link para abrir o formulário
     de preenchimento da nota técnica.
     """
     pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
-
     for seletor in [
         "a:has-text('Preencher')",
         "a:has-text('Elaborar')",
@@ -253,7 +373,6 @@ def _navegar_ate_formulario(context, page, nt):
             return formulario
         except Exception:
             pass
-
     for seletor in [
         "a:has-text('Preencher')",
         "a:has-text('Elaborar')",
@@ -265,19 +384,13 @@ def _navegar_ate_formulario(context, page, nt):
             return pagina_nt
         except Exception:
             pass
-
     raise Exception("Não foi possível localizar o botão de preenchimento do formulário")
-
-
 # ─────────────────────────────────────────────
 # Rotas básicas
 # ─────────────────────────────────────────────
-
 @app.route("/", methods=["GET"])
 def health():
     return "OK", 200
-
-
 @app.route("/teste", methods=["GET"])
 def teste():
     try:
@@ -296,24 +409,27 @@ def teste():
         })
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
-
-
 @app.route("/login", methods=["GET"])
 def login():
+    """Forca uma (re)autenticacao automatica e reporta o estado da sessao."""
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context()
         page    = context.new_page()
         try:
-            n_cookies = _inject_cookies(context)
-            page.goto(LOGIN_URL, timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=30000)
+            _exigir_sessao(context, page, forcar=True)
+            # confirma navegando para a listagem
+            try:
+                page.goto(LISTA_URL, timeout=60000)
+                page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                pass
             autenticado = _check_logged_in(page)
             resultado = {
-                "cookies_injetados": n_cookies,
+                "login_automatico": _tem_credenciais(),
                 "autenticado": autenticado,
                 "url_final": page.url,
-                "html": page.content()[:5000],
+                "cookies": len(context.cookies()),
                 "screenshot": _screenshot_b64(page)
             }
             browser.close()
@@ -322,8 +438,6 @@ def login():
             sc = _screenshot_b64(page)
             browser.close()
             return jsonify({"erro": str(e), "screenshot": sc}), 500
-
-
 @app.route("/diagnostico/<nt>", methods=["GET"])
 def diagnostico(nt):
     with sync_playwright() as p:
@@ -331,12 +445,10 @@ def diagnostico(nt):
         context = browser.new_context(accept_downloads=True)
         page    = context.new_page()
         try:
-            _inject_cookies(context)
+            _exigir_sessao(context, page)
             pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
-
             hashes    = _extrair_hashes(pagina_nt)
             screenshot = _screenshot_b64(pagina_nt)
-
             browser.close()
             return jsonify({
                 "nt": nt,
@@ -349,34 +461,24 @@ def diagnostico(nt):
             sc = _screenshot_b64(page)
             browser.close()
             return jsonify({"erro": str(e), "screenshot": sc}), 500
-
-
 @app.route("/baixar", methods=["POST"])
 def baixar():
     """(LEGADO) Baixa o PDF e devolve base64. Substituído por /processar."""
     nt = request.json.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
-
     pdfs  = []
     erros = []
-
     with _lock_navegador:  # garante UM navegador por vez (evita estouro de memória)
       with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context(accept_downloads=True)
         page    = context.new_page()
-
         try:
-            n_cookies = _inject_cookies(context)
-            if n_cookies == 0:
-                browser.close()
-                return jsonify({"erro": "Nenhum cookie configurado."}), 500
-
+            _exigir_sessao(context, page)
             pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
             hashes    = _extrair_hashes(pagina_nt)
             hashes_validos = [h for h in hashes if "hash" in h and h["hash"]]
-
             if not hashes_validos:
                 sc = _screenshot_b64(pagina_nt)
                 browser.close()
@@ -385,10 +487,8 @@ def baixar():
                     "url_pagina": pagina_nt.url,
                     "screenshot": sc
                 }), 404
-
             cookies = _cookie_str(context)
             browser.close()
-
             for idx, info in enumerate(hashes_validos[:5]):
                 try:
                     conteudo, content_type = _baixar_arquivo(info["hash"], cookies)
@@ -401,25 +501,20 @@ def baixar():
                     })
                 except Exception as e:
                     erros.append(f"Arquivo {idx+1} (hash={info['hash'][:12]}...): {str(e)}")
-
         except Exception as e:
             try:
                 browser.close()
             except Exception:
                 pass
             return jsonify({"erro": str(e), "avisos": erros}), 500
-
     if not pdfs:
         return jsonify({"erro": "Nenhum PDF baixado", "detalhes": erros}), 500
-
     return jsonify({
         "numeroNT": nt,
         "total_pdfs": len(pdfs),
         "pdfs": pdfs,
         "avisos": erros
     })
-
-
 def _texto_ruim(t):
     """True se o texto da pagina parece ilegivel: vazio, poucos chars ou lixo de fonte (cid)."""
     if not t or len(t.strip()) < 100:
@@ -428,8 +523,6 @@ def _texto_ruim(t):
     letras = sum(1 for c in t if c.isalpha())
     ratio = letras / max(len(t), 1)
     return cid > 20 or ratio < 0.5
-
-
 def _otsu_threshold(hist):
     """Limiar de Otsu (binarizacao) a partir do histograma de cinza, em Python puro."""
     total = sum(hist)
@@ -455,8 +548,6 @@ def _otsu_threshold(hist):
             max_var = var
             limiar = i
     return limiar
-
-
 def _preprocess(img):
     """Cinza + binarizacao (Otsu): o Tesseract le muito melhor preto-no-branco."""
     g = img.convert("L")
@@ -465,8 +556,6 @@ def _preprocess(img):
         return g.point(lambda p: 255 if p > thr else 0)
     except Exception:
         return g
-
-
 def _ocr_pagina(doc_fitz, indice, dpi=300):
     """Renderiza a pagina em alta resolucao, pre-processa e roda OCR (portugues)."""
     if fitz is None or pytesseract is None or Image is None:
@@ -476,8 +565,6 @@ def _ocr_pagina(doc_fitz, indice, dpi=300):
     img = Image.open(io.BytesIO(pix.tobytes("png")))
     img = _preprocess(img)
     return pytesseract.image_to_string(img, lang="por", config="--oem 1 --psm 6") or ""
-
-
 @app.route("/processar", methods=["POST"])
 def processar():
     """
@@ -491,30 +578,22 @@ def processar():
     except ImportError:
         subprocess.run(["pip", "install", "pdfplumber", "-q"], check=True)
         import pdfplumber
-
     nt = request.json.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
-
     with _lock_navegador:
         with sync_playwright() as p:
             browser = _launch_browser(p)
             context = browser.new_context(accept_downloads=True)
             page    = context.new_page()
             try:
-                n_cookies = _inject_cookies(context)
-                if n_cookies == 0:
-                    browser.close()
-                    return jsonify({"erro": "Nenhum cookie configurado"}), 500
-
+                _exigir_sessao(context, page)
                 pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
                 hashes    = _extrair_hashes(pagina_nt)
                 hashes_validos = [h for h in hashes if "hash" in h and h["hash"]]
-
                 if not hashes_validos:
                     browser.close()
                     return jsonify({"erro": "Nenhum anexo encontrado na NT", "numeroNT": nt}), 404
-
                 cookies = _cookie_str(context)
                 browser.close()
             except Exception as e:
@@ -523,7 +602,6 @@ def processar():
                 except Exception:
                     pass
                 return jsonify({"erro": str(e), "numeroNT": nt}), 500
-
     # baixa todos os arquivos; usa texto nativo (pdfplumber) onde der e faz OCR
     # SELETIVO so nas paginas escaneadas, com orcamento de tempo e de paginas.
     # Processa do menor para o maior (laudo/relatorio costuma ser o arquivo menor).
@@ -535,7 +613,6 @@ def processar():
     MAX_PAGINAS_OCR = 30      # teto de paginas que farao OCR
     OCR_TIME_BUDGET = 150     # segundos: para de fazer OCR depois disso (margem p/ timeout)
     t_inicio = time.time()
-
     # 1) baixa o conteudo de cada arquivo
     baixados = []
     for idx, info in enumerate(hashes_validos[:5]):
@@ -544,17 +621,14 @@ def processar():
             baixados.append((idx, conteudo))
         except Exception as e:
             texto_total += f"\n[erro ao baixar arquivo {idx+1}: {e}]\n"
-
     # 2) menor -> maior (gasta o orcamento de OCR nos arquivos menores primeiro)
     baixados.sort(key=lambda x: len(x[1]))
-
     for idx, conteudo in baixados:
         try:
             textos = []
             with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
                 for pg in pdf.pages:
                     textos.append(pg.extract_text() or "")
-
             doc_fitz = None
             for i, txt_pagina in enumerate(textos):
                 paginas_total += 1
@@ -578,14 +652,11 @@ def processar():
                     texto_total += txt_pagina + "\n"
             if doc_fitz is not None:
                 doc_fitz.close()
-
             texto_total += "\n--- fim do documento ---\n\n"
             arquivos += 1
         except Exception as e:
             texto_total += f"\n[erro ao ler arquivo: {e}]\n"
-
     texto_total = texto_total.strip()
-
     # links diretos de download de cada arquivo no e-NatJus (sem trazer o PDF pro n8n)
     arquivos_links = [
         {
@@ -594,19 +665,16 @@ def processar():
         }
         for i, h in enumerate(hashes_validos[:5])
     ]
-
     if paginas_total > 0:
         pct_ilegivel = round(100 * paginas_ilegiveis / paginas_total)
     else:
         pct_ilegivel = 100
-
     if pct_ilegivel >= 70:
         legibilidade = "ilegivel"
     elif pct_ilegivel >= 30:
         legibilidade = "parcial"
     else:
         legibilidade = "ok"
-
     return jsonify({
         "numeroNT": nt,
         "texto": texto_total,
@@ -619,8 +687,6 @@ def processar():
         "legibilidade": legibilidade,
         "arquivos_links": arquivos_links
     })
-
-
 @app.route("/listar", methods=["GET"])
 def listar():
     """
@@ -632,33 +698,29 @@ def listar():
     """
     apenas_pendentes = request.args.get("todos") != "1"
     debug = request.args.get("debug") == "1"
-
     re_nt        = re.compile(r"\b(\d{6})\b")
     re_processo  = re.compile(r"\b(\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4})\b")
     re_data_hora = re.compile(r"\b(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})\b")
-
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context()
         page    = context.new_page()
         try:
-            n_cookies = _inject_cookies(context)
-            if n_cookies == 0:
-                browser.close()
-                return jsonify({"erro": "Nenhum cookie configurado"}), 500
-
+            _exigir_sessao(context, page)
             page.goto(LISTA_URL, timeout=60000)
             page.wait_for_load_state("networkidle", timeout=30000)
-
             if not _check_logged_in(page):
-                sc = _screenshot_b64(page)
-                browser.close()
-                return jsonify({"erro": "Sessão expirada ou cookies inválidos",
-                                "screenshot": sc}), 401
-
+                # autocura: reloga uma vez e refaz
+                if _relogar_se_possivel(context, page):
+                    page.goto(LISTA_URL, timeout=60000)
+                    page.wait_for_load_state("networkidle", timeout=30000)
+                if not _check_logged_in(page):
+                    sc = _screenshot_b64(page)
+                    browser.close()
+                    return jsonify({"erro": "Sessão expirada ou cookies inválidos",
+                                    "screenshot": sc}), 401
             linhas = page.locator("table tr")
             total  = linhas.count()
-
             nts = []
             for i in range(total):
                 try:
@@ -667,40 +729,32 @@ def listar():
                     continue
                 if not texto:
                     continue
-
                 celulas = [c.strip() for c in re.split(r"[\t\n]+", texto) if c.strip()]
-
                 m_nt = re_nt.search(texto)
                 if not m_nt:
                     continue
-
                 numero_nt    = m_nt.group(1)
                 m_proc       = re_processo.search(texto)
                 m_data       = re_data_hora.search(texto)
                 numero_proc  = m_proc.group(1) if m_proc else ""
                 data_solic   = m_data.group(1) if m_data else ""
-
                 if "Nota T" in texto and "emitida" in texto:
                     status_site = "Nota Técnica emitida"
                 elif "Aguardando" in texto:
                     status_site = "Aguardando análise"
                 else:
                     status_site = ""
-
                 vara = ""
                 for c in celulas:
                     if any(k in c for k in ["Vara", "Comarca", "Núcleo", "Juizado", "Turma"]):
                         vara = c
                         break
-
                 paciente = ""
                 for idx, c in enumerate(celulas):
                     if re_data_hora.search(c) and idx + 1 < len(celulas):
                         paciente = celulas[idx + 1]
                         break
-
                 doenca_rara = "Sim" if "\tSim\t" in ("\t" + "\t".join(celulas) + "\t") else "Não"
-
                 registro = {
                     "numero_nt": numero_nt,
                     "data_solicitacao": data_solic,
@@ -712,15 +766,11 @@ def listar():
                 }
                 if debug:
                     registro["celulas"] = celulas
-
                 if apenas_pendentes and status_site != "Aguardando análise":
                     continue
-
                 nts.append(registro)
-
             browser.close()
             return jsonify({"total_nts": len(nts), "nts": nts})
-
         except Exception as e:
             sc = _screenshot_b64(page)
             try:
@@ -728,12 +778,9 @@ def listar():
             except Exception:
                 pass
             return jsonify({"erro": str(e), "screenshot": sc}), 500
-
-
 # ─────────────────────────────────────────────
 # Rota [FASE 2] — preenche o formulário da NT (sem submeter)
 # ─────────────────────────────────────────────
-
 @app.route("/preencher", methods=["POST"])
 def preencher():
     """
@@ -744,24 +791,16 @@ def preencher():
     nt = dados.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
-
     log = []
     screenshot_final = None
-
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context()
         page    = context.new_page()
-
         try:
-            n_cookies = _inject_cookies(context)
-            if n_cookies == 0:
-                browser.close()
-                return jsonify({"erro": "Nenhum cookie configurado."}), 500
-
+            _exigir_sessao(context, page)
             formulario = _navegar_ate_formulario(context, page, nt)
             log.append("Formulário localizado")
-
             if dados.get("cid"):
                 ok = _preencher_campo(formulario, "input[name*='cid'], #cid, input[placeholder*='CID']", dados["cid"])
                 log.append(f"CID: {'OK' if ok else 'FALHOU'}")
@@ -807,29 +846,22 @@ def preencher():
             if dados.get("referencias"):
                 ok = _preencher_campo(formulario, "textarea[name*='referencia'], textarea[name*='bibliograf']", dados["referencias"])
                 log.append(f"Referências: {'OK' if ok else 'FALHOU'}")
-
             natjus = dados.get("natjus_responsavel", "CE")
             ok = _selecionar_opcao(formulario, "select[name*='natjus'], select[name*='responsavel']", natjus)
             log.append(f"NatJus responsável ({natjus}): {'OK' if ok else 'FALHOU'}")
-
             if dados.get("instituicao_responsavel"):
                 ok = _preencher_campo(formulario, "input[name*='instituicao'], #instituicao", dados["instituicao_responsavel"])
                 log.append(f"Instituição: {'OK' if ok else 'FALHOU'}")
-
             tutoria = dados.get("apoio_tutoria", "Não")
             ok = _selecionar_opcao(formulario, "select[name*='tutoria']", tutoria)
             log.append(f"Apoio tutoria ({tutoria}): {'OK' if ok else 'FALHOU'}")
-
             if dados.get("outras_informacoes"):
                 ok = _preencher_campo(formulario, "textarea[name*='outras_info'], textarea[name*='outras_informacoes']", dados["outras_informacoes"])
                 log.append(f"Outras informações: {'OK' if ok else 'FALHOU'}")
-
             screenshot_final = _screenshot_b64(formulario)
             log.append("Formulário preenchido — NÃO submetido (aguardando aprovação manual)")
-
             browser.close()
             return jsonify({"sucesso": True, "numeroNT": nt, "log": log, "screenshot": screenshot_final})
-
         except Exception as e:
             sc = _screenshot_b64(page)
             try:
@@ -837,12 +869,9 @@ def preencher():
             except Exception:
                 pass
             return jsonify({"erro": str(e), "log": log, "screenshot": sc}), 500
-
-
 # ─────────────────────────────────────────────
 # Rota [LEGADO] — extrai texto de um PDF em base64
 # ─────────────────────────────────────────────
-
 @app.route("/comprimir", methods=["POST"])
 def comprimir():
     """(LEGADO) Extrai texto de um PDF base64. Hoje /processar já faz isso interno."""
@@ -854,40 +883,30 @@ def comprimir():
             import subprocess
             subprocess.run(["pip", "install", "pdfplumber", "-q"], check=True)
             import pdfplumber
-
         dados = request.json
         pdf_base64 = dados.get("pdfBase64")
         numero_nt  = dados.get("numeroNT", "")
-
         if not pdf_base64:
             return jsonify({"erro": "pdfBase64 obrigatorio"}), 400
-
         pdf_bytes = base64.b64decode(pdf_base64)
         texto = ""
         total_paginas = 0
-
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             total_paginas = len(pdf.pages)
             for page in pdf.pages:
                 texto += page.extract_text() or ""
                 texto += "\n\n"
-
         texto = texto.strip()
-
         if not texto:
             return jsonify({"erro": "Nenhum texto extraído — PDF pode ser imagem escaneada"}), 422
-
         return jsonify({
             "numeroNT":   numero_nt,
             "texto":      texto,
             "caracteres": len(texto),
             "paginas":    total_paginas
         })
-
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
-
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
