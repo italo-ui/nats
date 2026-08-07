@@ -735,15 +735,22 @@ def listar():
                     continue
                 numero_nt    = m_nt.group(1)
                 m_proc       = re_processo.search(texto)
-                m_data       = re_data_hora.search(texto)
+                todas_datas  = re_data_hora.findall(texto)
                 numero_proc  = m_proc.group(1) if m_proc else ""
-                data_solic   = m_data.group(1) if m_data else ""
+                data_solic   = todas_datas[0] if todas_datas else ""
                 if "Nota T" in texto and "emitida" in texto:
                     status_site = "Nota Técnica emitida"
                 elif "Aguardando" in texto:
                     status_site = "Aguardando análise"
                 else:
                     status_site = ""
+                # NT ja emitida: a data de emissao/conclusao e a data-hora MAIS recente da
+                # linha (a listagem traz solicitacao e, para emitidas, tambem a emissao).
+                # So usamos quando ha uma 2a data distinta; senao fica vazio e o n8n cai
+                # na data de deteccao.
+                data_emissao = ""
+                if status_site == "Nota Técnica emitida" and len(todas_datas) >= 2:
+                    data_emissao = todas_datas[-1]
                 vara = ""
                 for c in celulas:
                     if any(k in c for k in ["Vara", "Comarca", "Núcleo", "Juizado", "Turma"]):
@@ -758,6 +765,7 @@ def listar():
                 registro = {
                     "numero_nt": numero_nt,
                     "data_solicitacao": data_solic,
+                    "data_emissao": data_emissao,
                     "paciente": paciente,
                     "numero_processo": numero_proc,
                     "vara": vara,
