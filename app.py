@@ -715,105 +715,252 @@ def processar():
         "legibilidade": legibilidade,
         "arquivos_links": arquivos_links
     })
-@app.route("/listar", methods=["GET"])
-def listar():
-    """
-    Lista as NTs da página de listagem do e-NatJus, com campos já separados.
-    Por padrão devolve só as 'Aguardando análise' (as que precisam de parecer).
-    Parâmetros opcionais:
-      ?todos=1  -> devolve também as já emitidas
-      ?debug=1  -> inclui as células brutas de cada linha
-    """
-    apenas_pendentes = request.args.get("todos") != "1"
-    debug = request.args.get("debug") == "1"
+def _linha_para_registro(texto, debug):
+    """Converte o texto bruto de uma linha da listagem em um registro. None se nao for NT."""
     re_nt        = re.compile(r"\b(\d{6})\b")
     re_processo  = re.compile(r"\b(\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4})\b")
     re_data_hora = re.compile(r"\b(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})\b")
-    with sync_playwright() as p:
-        browser = _launch_browser(p)
-        context = browser.new_context()
-        page    = context.new_page()
-        try:
-            _exigir_sessao(context, page)
-            page.goto(LISTA_URL, timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=30000)
-            if not _check_logged_in(page):
-                # autocura: reloga uma vez e refaz
-                if _relogar_se_possivel(context, page):
-                    page.goto(LISTA_URL, timeout=60000)
-                    page.wait_for_load_state("networkidle", timeout=30000)
-                if not _check_logged_in(page):
-                    sc = _screenshot_b64(page)
-                    browser.close()
-                    return jsonify({"erro": "Sessão expirada ou cookies inválidos",
-                                    "screenshot": sc}), 401
-            linhas = page.locator("table tr")
-            total  = linhas.count()
-            nts = []
-            for i in range(total):
-                try:
-                    texto = linhas.nth(i).inner_text().strip()
-                except Exception:
-                    continue
-                if not texto:
-                    continue
-                celulas = [c.strip() for c in re.split(r"[\t\n]+", texto) if c.strip()]
-                m_nt = re_nt.search(texto)
-                if not m_nt:
-                    continue
-                numero_nt    = m_nt.group(1)
-                m_proc       = re_processo.search(texto)
-                todas_datas  = re_data_hora.findall(texto)
-                numero_proc  = m_proc.group(1) if m_proc else ""
-                data_solic   = todas_datas[0] if todas_datas else ""
-                if "Nota T" in texto and "emitida" in texto:
-                    status_site = "Nota Técnica emitida"
-                elif "Aguardando" in texto:
-                    status_site = "Aguardando análise"
-                else:
-                    status_site = ""
-                # NT ja emitida: a data de emissao/conclusao e a data-hora MAIS recente da
-                # linha (a listagem traz solicitacao e, para emitidas, tambem a emissao).
-                # So usamos quando ha uma 2a data distinta; senao fica vazio e o n8n cai
-                # na data de deteccao.
-                data_emissao = ""
-                if status_site == "Nota Técnica emitida" and len(todas_datas) >= 2:
-                    data_emissao = todas_datas[-1]
-                vara = ""
-                for c in celulas:
-                    if any(k in c for k in ["Vara", "Comarca", "Núcleo", "Juizado", "Turma"]):
-                        vara = c
-                        break
-                paciente = ""
-                for idx, c in enumerate(celulas):
-                    if re_data_hora.search(c) and idx + 1 < len(celulas):
-                        paciente = celulas[idx + 1]
-                        break
-                doenca_rara = "Sim" if "\tSim\t" in ("\t" + "\t".join(celulas) + "\t") else "Não"
-                registro = {
-                    "numero_nt": numero_nt,
-                    "data_solicitacao": data_solic,
-                    "data_emissao": data_emissao,
-                    "paciente": paciente,
-                    "numero_processo": numero_proc,
-                    "vara": vara,
-                    "status_site": status_site,
-                    "doenca_rara": doenca_rara,
-                }
-                if debug:
-                    registro["celulas"] = celulas
-                if apenas_pendentes and status_site != "Aguardando análise":
-                    continue
-                nts.append(registro)
-            browser.close()
-            return jsonify({"total_nts": len(nts), "nts": nts})
-        except Exception as e:
-            sc = _screenshot_b64(page)
+    if not texto:
+        return None
+    celulas = [c.strip() for c in re.split(r"[\t\n]+", texto) if c.strip()]
+    m_nt = re_nt.search(texto)
+    if not m_nt:
+        return None
+    numero_nt   = m_nt.group(1)
+    m_proc      = re_processo.search(texto)
+    todas_datas = re_data_hora.findall(texto)
+    numero_proc = m_proc.group(1) if m_proc else ""
+    data_solic  = todas_datas[0] if todas_datas else ""
+    if "Nota T" in texto and "emitida" in texto:
+        status_site = "Nota Técnica emitida"
+    elif "Aguardando" in texto:
+        status_site = "Aguardando análise"
+    else:
+        status_site = ""
+    # NT ja emitida: a data de emissao/conclusao e a data-hora MAIS recente da linha
+    # (a listagem traz solicitacao e, para emitidas, tambem a emissao). So usamos quando
+    # ha uma 2a data distinta; senao fica vazio e o n8n cai na data de deteccao.
+    data_emissao = ""
+    if status_site == "Nota Técnica emitida" and len(todas_datas) >= 2:
+        data_emissao = todas_datas[-1]
+    vara = ""
+    for c in celulas:
+        if any(k in c for k in ["Vara", "Comarca", "Núcleo", "Juizado", "Turma"]):
+            vara = c
+            break
+    paciente = ""
+    for idx, c in enumerate(celulas):
+        if re_data_hora.search(c) and idx + 1 < len(celulas):
+            paciente = celulas[idx + 1]
+            break
+    doenca_rara = "Sim" if "\tSim\t" in ("\t" + "\t".join(celulas) + "\t") else "Não"
+    registro = {
+        "numero_nt": numero_nt,
+        "data_solicitacao": data_solic,
+        "data_emissao": data_emissao,
+        "paciente": paciente,
+        "numero_processo": numero_proc,
+        "vara": vara,
+        "status_site": status_site,
+        "doenca_rara": doenca_rara,
+    }
+    if debug:
+        registro["celulas"] = celulas
+    return registro
+
+
+@app.route("/listar", methods=["GET"])
+def listar():
+    """
+    Lista as NTs da pagina de listagem do e-NatJus, com campos ja separados.
+    Por padrao devolve so as 'Aguardando analise' (as que precisam de parecer).
+
+    A listagem e um DataTables (id 'tabela-solicitacao') com ~3.2 mil registros:
+    a URL nao muda ao paginar, entao percorremos clicando no botao "»" e ajustamos
+    o seletor "Itens por pagina" (aceita 10/25/50/100) para reduzir os cliques.
+
+    Parametros opcionais:
+      ?todos=1      -> devolve tambem as ja emitidas
+      ?debug=1      -> inclui as celulas brutas de cada linha
+      ?paginas=N    -> quantas paginas percorrer (default 1, teto 40)
+      ?porpagina=N  -> itens por pagina: 10 | 25 | 50 | 100 (default 25)
+
+    Os defaults reproduzem exatamente o comportamento antigo (1 pagina de 25), para
+    que subir esta versao nao mude nada sozinho. Quem quiser varrer mais fundo pede
+    explicitamente, ex.: /listar?todos=1&paginas=5&porpagina=100
+    """
+    apenas_pendentes = request.args.get("todos") != "1"
+    debug = request.args.get("debug") == "1"
+    try:
+        max_paginas = max(1, min(int(request.args.get("paginas", "1")), 40))
+    except Exception:
+        max_paginas = 1
+    porpagina = request.args.get("porpagina", "25")
+    if porpagina not in ("10", "25", "50", "100"):
+        porpagina = "100"
+
+    with _lock_navegador:
+        with sync_playwright() as p:
+            browser = _launch_browser(p)
+            context = browser.new_context()
+            page    = context.new_page()
             try:
+                _exigir_sessao(context, page)
+                page.goto(LISTA_URL, timeout=60000)
+                page.wait_for_load_state("networkidle", timeout=30000)
+                if not _check_logged_in(page):
+                    # autocura: reloga uma vez e refaz
+                    if _relogar_se_possivel(context, page):
+                        page.goto(LISTA_URL, timeout=60000)
+                        page.wait_for_load_state("networkidle", timeout=30000)
+                    if not _check_logged_in(page):
+                        sc = _screenshot_b64(page)
+                        browser.close()
+                        return jsonify({"erro": "Sessão expirada ou cookies inválidos",
+                                        "screenshot": sc}), 401
+
+                # espera a tabela montar
+                try:
+                    page.wait_for_selector("#tabela-solicitacao tbody tr", timeout=20000)
+                except Exception:
+                    pass
+
+                # "Itens por pagina" -> 100 (menos cliques para cobrir o mesmo intervalo)
+                try:
+                    page.select_option('select[name="tabela-solicitacao_length"]', porpagina)
+                    page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+
+                nts = []
+                vistos = set()
+                paginas_lidas = 0
+                linhas_lidas = 0
+
+                for _pag in range(max_paginas):
+                    linhas = page.locator("#tabela-solicitacao tbody tr")
+                    total = linhas.count()
+                    if total == 0:
+                        linhas = page.locator("table tr")
+                        total = linhas.count()
+                    paginas_lidas += 1
+                    for i in range(total):
+                        try:
+                            texto = linhas.nth(i).inner_text().strip()
+                        except Exception:
+                            continue
+                        reg = _linha_para_registro(texto, debug)
+                        if not reg:
+                            continue
+                        linhas_lidas += 1
+                        if reg["numero_nt"] in vistos:
+                            continue
+                        vistos.add(reg["numero_nt"])
+                        if apenas_pendentes and reg["status_site"] != "Aguardando análise":
+                            continue
+                        nts.append(reg)
+
+                    # avanca pelo botao "»" do DataTables; para se estiver desabilitado
+                    try:
+                        prox = page.locator("#tabela-solicitacao_next")
+                        if prox.count() == 0:
+                            break
+                        classe = prox.first.get_attribute("class") or ""
+                        if "disabled" in classe:
+                            break
+                        prox.first.locator("a").first.click()
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        break
+
                 browser.close()
-            except Exception:
-                pass
-            return jsonify({"erro": str(e), "screenshot": sc}), 500
+                return jsonify({
+                    "total_nts": len(nts),
+                    "paginas_lidas": paginas_lidas,
+                    "itens_por_pagina": porpagina,
+                    "linhas_varridas": linhas_lidas,
+                    "nts": nts
+                })
+            except Exception as e:
+                sc = _screenshot_b64(page)
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                return jsonify({"erro": str(e), "screenshot": sc}), 500
+
+
+# ─────────────────────────────────────────────
+# Conclusao da NT (favoravel / nao favoravel)
+# ─────────────────────────────────────────────
+# Na pagina da NT o campo e <select id="selConclusao" name="selConclusao">
+# com as opcoes: "" (Selecione) | "F" (Favoravel) | "N" (Nao favoravel).
+_CONCLUSAO_TEXTO = {"F": "Favorável", "N": "Não favorável", "": ""}
+
+
+def _ler_conclusao(pagina):
+    """Le o <select id=selConclusao> da pagina da NT. Devolve (valor, texto) ou (None, None)."""
+    for seletor in ["#selConclusao", "select[name='selConclusao']"]:
+        try:
+            el = pagina.locator(seletor).first
+            if el.count() == 0:
+                continue
+            valor = el.input_value(timeout=5000)
+            valor = (valor or "").strip().upper()
+            texto = _CONCLUSAO_TEXTO.get(valor)
+            if texto is None:
+                # opcao inesperada: devolve o rotulo visivel da opcao selecionada
+                try:
+                    texto = pagina.locator(seletor + " option:checked").first.inner_text().strip()
+                except Exception:
+                    texto = valor
+            return valor, texto
+        except Exception:
+            continue
+    return None, None
+
+
+@app.route("/conclusao/<nt>", methods=["GET"])
+def conclusao(nt):
+    """
+    Devolve a conclusao registrada na NT: Favoravel / Nao favoravel.
+    Usado pelo NATJUS1 apenas para as NTs recem-detectadas como emitidas.
+    """
+    with _lock_navegador:
+        with sync_playwright() as p:
+            browser = _launch_browser(p)
+            context = browser.new_context()
+            page    = context.new_page()
+            try:
+                _exigir_sessao(context, page)
+                pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
+                valor, texto = _ler_conclusao(pagina_nt)
+
+                # a NT emitida pode guardar o campo no formulario; tenta abrir se preciso
+                if valor is None:
+                    try:
+                        formulario = _navegar_ate_formulario(context, page, nt)
+                        valor, texto = _ler_conclusao(formulario)
+                    except Exception:
+                        pass
+
+                encontrado = valor is not None
+                browser.close()
+                return jsonify({
+                    "numeroNT": str(nt),
+                    "encontrado": encontrado,
+                    "conclusao_valor": (valor or ""),
+                    "conclusao_favoravel": (texto or ""),
+                })
+            except Exception as e:
+                sc = _screenshot_b64(page)
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                return jsonify({"erro": str(e), "numeroNT": str(nt), "screenshot": sc}), 500
+
+
 # ─────────────────────────────────────────────
 # Rota [FASE 2] — preenche o formulário da NT (sem submeter)
 # ─────────────────────────────────────────────
