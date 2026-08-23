@@ -1,9 +1,12 @@
 import os, time, base64, json, subprocess, urllib.request, urllib.error, re
 import io
 try:
-    import fitz  # PyMuPDF (rasteriza paginas; pip puro, sem libs de sistema)
+    import pymupdf as fitz  # PyMuPDF >= 1.24 (nome novo)
 except Exception:
-    fitz = None
+    try:
+        import fitz  # alias legado, ainda aceito
+    except Exception:
+        fitz = None
 try:
     import pytesseract
     from PIL import Image
@@ -402,10 +405,35 @@ def teste():
              "b.close(); p.stop(); print('OK')"],
             capture_output=True, text=True, timeout=60
         )
+        # --- status do OCR: se qualquer peca faltar, o OCR morre em SILENCIO ---
+        ocr = {
+            "pymupdf": fitz is not None,
+            "pytesseract": pytesseract is not None,
+            "pillow": Image is not None,
+            "pdfplumber": False,
+            "tesseract_bin": None,
+            "idiomas": [],
+        }
+        try:
+            import pdfplumber  # noqa: F401
+            ocr["pdfplumber"] = True
+        except Exception:
+            pass
+        if pytesseract is not None:
+            try:
+                ocr["tesseract_bin"] = str(pytesseract.get_tesseract_version())
+                ocr["idiomas"] = sorted(pytesseract.get_languages(config=""))
+            except Exception as e:
+                ocr["erro"] = str(e)
+        ocr["ok"] = bool(
+            ocr["pymupdf"] and ocr["pytesseract"] and ocr["pillow"]
+            and ocr["pdfplumber"] and ocr["tesseract_bin"] and "por" in ocr["idiomas"]
+        )
         return jsonify({
             "playwright": "OK" if result.returncode == 0 else "ERRO",
             "stdout": result.stdout.strip(),
-            "stderr": result.stderr.strip()
+            "stderr": result.stderr.strip(),
+            "ocr": ocr
         })
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
