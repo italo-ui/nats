@@ -364,7 +364,6 @@ def _navegar_ate_formulario(context, page, nt):
     """
     pagina = _navegar_ate_pagina_nt(context, page, nt)
     try:
-        # espera a aba da tecnologia montar — e o que garante que o formulario existe
         pagina.wait_for_selector("text=Diagnóstico Principal", timeout=20000)
     except Exception:
         raise Exception(
@@ -378,20 +377,30 @@ def _grupo_do_rotulo(pagina, texto):
     """
     Devolve o container do campo a partir do texto do rotulo.
 
-    Procurar por name/id e fragil: sao gerados pelo framework e mudam entre versoes. O rotulo
-    visivel e o que o usuario le e o que a equipe do e-NatJus tem menos incentivo para mudar.
-    O layout e Bootstrap: <div class="form-group"><label>..</label><div><controle></div></div>.
+    O CASAMENTO E ANCORADO, e isso nao e preciosismo. No teste de 15/09/2026 o padrao era
+    substring e o rotulo 'CID' casou com 'Cidade' — que existe na mesma pagina, nos dados do
+    paciente, e aparece ANTES. O .first pegou o campo errado. Uma busca frouxa nao falha: ela
+    acerta outra coisa, que e o modo de errar mais caro que existe num formulario.
+
+    Tenta o padrao exato (aceitando o asterisco de obrigatorio no fim); so cai para substring
+    se o exato nao achar nada, porque alguns rotulos sao longos e quebram em varias linhas.
     """
-    lab = pagina.locator("label", has_text=texto).first
-    lab.wait_for(state="attached", timeout=8000)
-    return lab.locator("xpath=ancestor::div[contains(@class,'form-group')][1]")
+    exato = re.compile(r"^\s*" + re.escape(texto) + r"\s*\*?\s*$", re.IGNORECASE)
+    lab = pagina.locator("label").filter(has_text=exato)
+    if lab.count() == 0:
+        lab = pagina.locator("label").filter(has_text=texto)
+    if lab.count() == 0:
+        raise Exception("rotulo nao encontrado: " + texto)
+    primeiro = lab.first
+    primeiro.wait_for(state="attached", timeout=8000)
+    return primeiro.locator("xpath=ancestor::div[contains(@class,'form-group')][1]")
 
 
 def _texto_por_rotulo(pagina, rotulo, valor, log, nome):
     """Preenche input ou textarea localizado pelo rotulo."""
     try:
         grupo = _grupo_do_rotulo(pagina, rotulo)
-        campo = grupo.locator("input[type='text'], input:not([type]), textarea").first
+        campo = grupo.locator("input[type='text']:visible, input:not([type]):visible, textarea:visible").first
         campo.wait_for(state="visible", timeout=8000)
         campo.fill("")
         campo.fill(str(valor))
@@ -406,27 +415,30 @@ def _texto_por_rotulo(pagina, rotulo, valor, log, nome):
 
 def _select_por_rotulo(pagina, rotulo, valor, log, nome):
     """
-    Seleciona uma opcao. Cobre os dois tipos de controle que o formulario usa:
+    Seleciona uma opcao. Cobre os dois tipos de controle do formulario:
 
       1. <select> comum  -> select_option pelo rotulo visivel.
-      2. combobox com busca (CID e NatJus Responsavel) -> o <select> original fica escondido e
-         quem aparece e um widget. Tentar select_option nele da 'element is not visible'.
-         Entao: clica no widget, digita no campo de busca e clica na opcao.
+      2. combobox select2 (CID e NatJus Responsavel) -> o <select> original fica ESCONDIDO e
+         quem aparece e o widget. No teste de 15/09/2026 o seletor do gatilho incluia
+         '.form-control', que casou justamente com o select escondido; o .first pegou ele e o
+         click ficou esperando um elemento invisivel ate estourar o timeout. Por isso agora
+         todo seletor de gatilho traz ':visible' e o '.form-control' saiu da lista: ele e o
+         que o widget substitui, nao o widget.
 
-    A ordem importa: tenta o caminho barato primeiro e so cai no widget se o elemento nao
-    estiver visivel.
+    A caixa de busca do select2 e anexada ao <body>, fora do form-group — por isso ela e
+    procurada na pagina inteira, e nao dentro do grupo.
     """
     alvo = str(valor)
     try:
         grupo = _grupo_do_rotulo(pagina, rotulo)
     except Exception as e:
-        log.append(f"{nome}: FALHOU (rotulo nao encontrado: {str(e)[:70]})")
+        log.append(f"{nome}: FALHOU ({str(e)[:90]})")
         return False
 
     # 1. <select> comum
     try:
-        sel = grupo.locator("select").first
-        if sel.count() and sel.is_visible():
+        sel = grupo.locator("select:visible").first
+        if sel.count():
             try:
                 sel.select_option(label=alvo, timeout=5000)
             except Exception:
@@ -436,28 +448,37 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
     except Exception:
         pass
 
-    # 2. combobox com busca
+    # 2. combobox select2
     try:
         gatilho = grupo.locator(
-            ".select2-selection, .select2-choice, .selectize-input, [role='combobox'], .form-control"
+            ".select2-selection:visible, .select2-choice:visible, .select2-container:visible, "
+            ".selectize-input:visible, [role='combobox']:visible"
         ).first
-        gatilho.click(timeout=8000)
-        pagina.wait_for_timeout(400)
+        gatilho.wait_for(state="visible", timeout=8000)
+        gatilho.click()
+        pagina.wait_for_timeout(500)
         busca = pagina.locator(
-            "input.select2-search__field, .select2-search input, .selectize-input input, input[role='searchbox']"
+            "input.select2-search__field:visible, .select2-search input:visible, "
+            ".selectize-input input:visible, input[role='searchbox']:visible"
         ).last
         try:
             busca.fill(alvo, timeout=4000)
         except Exception:
             pagina.keyboard.type(alvo, delay=40)
-        pagina.wait_for_timeout(900)
+        pagina.wait_for_timeout(1200)
         opcao = pagina.locator(
-            ".select2-results__option, .select2-result-label, .selectize-dropdown-content .option, li[role='option']"
+            ".select2-results__option:visible, .select2-result-label:visible, "
+            ".selectize-dropdown-content .option:visible, li[role='option']:visible"
         ).first
         opcao.wait_for(state="visible", timeout=8000)
         escolhida = (opcao.inner_text() or "").strip()
+        # Uma lista que nao achou nada mostra 'Nenhum resultado' e clicar nisso nao seleciona.
+        if re.search(r"nenhum resultado|no results|carregando|searching", escolhida, re.IGNORECASE):
+            pagina.keyboard.press("Escape")
+            log.append(f"{nome}: FALHOU (a busca por '{alvo}' nao devolveu opcao: '{escolhida[:40]}')")
+            return False
         opcao.click()
-        pagina.wait_for_timeout(300)
+        pagina.wait_for_timeout(400)
         log.append(f"{nome}: OK ({escolhida[:60]})")
         return True
     except Exception as e:
@@ -1108,6 +1129,59 @@ def conclusao(nt):
 # ─────────────────────────────────────────────
 # Rota [FASE 2] — preenche o formulário da NT (sem submeter)
 # ─────────────────────────────────────────────
+@app.route("/campos/<nt>", methods=["GET"])
+def campos(nt):
+    """
+    Despeja todo campo do formulario da NT: rotulo, tag, tipo, name, id, classes e, para os
+    selects, as primeiras opcoes. Nao preenche e nao grava nada.
+
+    Existe para nao precisar adivinhar. Quando um campo falhar, esta rota diz exatamente com o
+    que ele se parece no DOM, em vez de custar mais um ciclo de deploy para descobrir.
+    """
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = browser.new_context()
+        page = context.new_page()
+        try:
+            _exigir_sessao(context, page)
+            form = _navegar_ate_formulario(context, page, nt)
+            dados = form.evaluate("""() => {
+                const out = [];
+                document.querySelectorAll('.form-group').forEach(g => {
+                    const lab = g.querySelector('label');
+                    g.querySelectorAll('input, select, textarea').forEach(c => {
+                        const est = window.getComputedStyle(c);
+                        const item = {
+                            rotulo: lab ? lab.innerText.trim().replace(/\\s+/g, ' ') : '',
+                            tag: c.tagName.toLowerCase(),
+                            tipo: c.type || '',
+                            name: c.name || '',
+                            id: c.id || '',
+                            classe: c.className || '',
+                            visivel: est.display !== 'none' && est.visibility !== 'hidden',
+                            vizinhos: Array.from(g.querySelectorAll('div,span'))
+                                .map(e => e.className).filter(Boolean).slice(0, 6)
+                        };
+                        if (c.tagName.toLowerCase() === 'select') {
+                            item.opcoes = Array.from(c.options).slice(0, 8).map(o => o.text.trim());
+                            item.total_opcoes = c.options.length;
+                        }
+                        out.push(item);
+                    });
+                });
+                return out;
+            }""")
+            browser.close()
+            return jsonify({"numeroNT": nt, "total": len(dados), "campos": dados})
+        except Exception as e:
+            sc = _screenshot_b64(page)
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return jsonify({"erro": str(e), "screenshot": sc}), 500
+
+
 @app.route("/preencher", methods=["POST"])
 def preencher():
     """
@@ -1148,8 +1222,8 @@ def preencher():
             if dados.get("diagnostico"):
                 _texto_por_rotulo(form, "Diagnóstico", dados["diagnostico"], log, "Diagnostico")
             if dados.get("meios_confirmatorios"):
-                _texto_por_rotulo(form, "confirmatório", dados["meios_confirmatorios"],
-                                  log, "Meios confirmatorios")
+                _texto_por_rotulo(form, "Meio(s) confirmatório(s) do diagnóstico já realizado(s)",
+                                  dados["meios_confirmatorios"], log, "Meios confirmatorios")
 
             natjus = dados.get("natjus_responsavel", "Ceará")
             _select_por_rotulo(form, "NatJus Responsável", natjus, log, "NatJus responsavel")
@@ -1158,7 +1232,8 @@ def preencher():
             _texto_por_rotulo(form, "Instituição Responsável", inst, log, "Instituicao responsavel")
 
             tutoria = dados.get("apoio_tutoria", "Não")
-            _select_por_rotulo(form, "apoio de tutoria", tutoria, log, "Apoio de tutoria")
+            _select_por_rotulo(form, "Nota técnica elaborada com apoio de tutoria?",
+                               tutoria, log, "Apoio de tutoria")
 
             antes = _screenshot_b64(form)
 
