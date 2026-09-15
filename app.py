@@ -355,39 +355,115 @@ def _preencher_campo(page, seletor, valor):
         return False
 def _navegar_ate_formulario(context, page, nt):
     """
-    Navega até a página da NT e clica no botão/link para abrir o formulário
-    de preenchimento da nota técnica.
+    Abre a pagina da NT. NAO existe botao 'Preencher' no e-NatJus: a pagina da NT JA E o
+    formulario. A versao anterior desta funcao procurava a:has-text('Preencher') e variacoes,
+    nao achava nenhuma e levantava excecao depois de ter chegado exatamente onde precisava.
+
+    Confirmado na sondagem da NT 568896: a pagina traz os anexos, os dados do paciente, do
+    advogado e do processo, e entao uma aba por tecnologia com o formulario inteiro dentro.
     """
-    pagina_nt = _navegar_ate_pagina_nt(context, page, nt)
-    for seletor in [
-        "a:has-text('Preencher')",
-        "a:has-text('Elaborar')",
-        "button:has-text('Preencher')",
-        "button:has-text('Elaborar')",
-        "a:has-text('Nota Técnica')",
-        ".btn:has-text('Preencher')",
-    ]:
+    pagina = _navegar_ate_pagina_nt(context, page, nt)
+    try:
+        # espera a aba da tecnologia montar — e o que garante que o formulario existe
+        pagina.wait_for_selector("text=Diagnóstico Principal", timeout=20000)
+    except Exception:
+        raise Exception(
+            "A pagina da NT abriu, mas a aba da tecnologia nao apareceu. "
+            "Verifique se a NT tem uma tecnologia cadastrada (link '+ Adicionar Tecnologia')."
+        )
+    return pagina
+
+
+def _grupo_do_rotulo(pagina, texto):
+    """
+    Devolve o container do campo a partir do texto do rotulo.
+
+    Procurar por name/id e fragil: sao gerados pelo framework e mudam entre versoes. O rotulo
+    visivel e o que o usuario le e o que a equipe do e-NatJus tem menos incentivo para mudar.
+    O layout e Bootstrap: <div class="form-group"><label>..</label><div><controle></div></div>.
+    """
+    lab = pagina.locator("label", has_text=texto).first
+    lab.wait_for(state="attached", timeout=8000)
+    return lab.locator("xpath=ancestor::div[contains(@class,'form-group')][1]")
+
+
+def _texto_por_rotulo(pagina, rotulo, valor, log, nome):
+    """Preenche input ou textarea localizado pelo rotulo."""
+    try:
+        grupo = _grupo_do_rotulo(pagina, rotulo)
+        campo = grupo.locator("input[type='text'], input:not([type]), textarea").first
+        campo.wait_for(state="visible", timeout=8000)
+        campo.fill("")
+        campo.fill(str(valor))
+        lido = campo.input_value()
+        ok = lido.strip() == str(valor).strip()
+        log.append(f"{nome}: {'OK' if ok else 'GRAVOU DIFERENTE (' + lido[:40] + ')'}")
+        return ok
+    except Exception as e:
+        log.append(f"{nome}: FALHOU ({type(e).__name__}: {str(e)[:90]})")
+        return False
+
+
+def _select_por_rotulo(pagina, rotulo, valor, log, nome):
+    """
+    Seleciona uma opcao. Cobre os dois tipos de controle que o formulario usa:
+
+      1. <select> comum  -> select_option pelo rotulo visivel.
+      2. combobox com busca (CID e NatJus Responsavel) -> o <select> original fica escondido e
+         quem aparece e um widget. Tentar select_option nele da 'element is not visible'.
+         Entao: clica no widget, digita no campo de busca e clica na opcao.
+
+    A ordem importa: tenta o caminho barato primeiro e so cai no widget se o elemento nao
+    estiver visivel.
+    """
+    alvo = str(valor)
+    try:
+        grupo = _grupo_do_rotulo(pagina, rotulo)
+    except Exception as e:
+        log.append(f"{nome}: FALHOU (rotulo nao encontrado: {str(e)[:70]})")
+        return False
+
+    # 1. <select> comum
+    try:
+        sel = grupo.locator("select").first
+        if sel.count() and sel.is_visible():
+            try:
+                sel.select_option(label=alvo, timeout=5000)
+            except Exception:
+                sel.select_option(value=alvo, timeout=5000)
+            log.append(f"{nome}: OK ({alvo})")
+            return True
+    except Exception:
+        pass
+
+    # 2. combobox com busca
+    try:
+        gatilho = grupo.locator(
+            ".select2-selection, .select2-choice, .selectize-input, [role='combobox'], .form-control"
+        ).first
+        gatilho.click(timeout=8000)
+        pagina.wait_for_timeout(400)
+        busca = pagina.locator(
+            "input.select2-search__field, .select2-search input, .selectize-input input, input[role='searchbox']"
+        ).last
         try:
-            pagina_nt.wait_for_selector(seletor, timeout=5000)
-            with context.expect_page() as nova_pagina_info:
-                pagina_nt.click(seletor)
-            formulario = nova_pagina_info.value
-            formulario.wait_for_load_state("networkidle", timeout=30000)
-            return formulario
+            busca.fill(alvo, timeout=4000)
         except Exception:
-            pass
-    for seletor in [
-        "a:has-text('Preencher')",
-        "a:has-text('Elaborar')",
-        "button:has-text('Preencher')",
-    ]:
-        try:
-            pagina_nt.click(seletor)
-            pagina_nt.wait_for_load_state("networkidle", timeout=30000)
-            return pagina_nt
-        except Exception:
-            pass
-    raise Exception("Não foi possível localizar o botão de preenchimento do formulário")
+            pagina.keyboard.type(alvo, delay=40)
+        pagina.wait_for_timeout(900)
+        opcao = pagina.locator(
+            ".select2-results__option, .select2-result-label, .selectize-dropdown-content .option, li[role='option']"
+        ).first
+        opcao.wait_for(state="visible", timeout=8000)
+        escolhida = (opcao.inner_text() or "").strip()
+        opcao.click()
+        pagina.wait_for_timeout(300)
+        log.append(f"{nome}: OK ({escolhida[:60]})")
+        return True
+    except Exception as e:
+        log.append(f"{nome}: FALHOU ({type(e).__name__}: {str(e)[:90]})")
+        return False
+
 # ─────────────────────────────────────────────
 # Rotas básicas
 # ─────────────────────────────────────────────
@@ -543,6 +619,63 @@ def baixar():
         "pdfs": pdfs,
         "avisos": erros
     })
+# ─────────────────────────────────────────────
+# CACHE DA EXTRACAO DOS AUTOS
+# ─────────────────────────────────────────────
+# O texto dos autos e pedido DUAS vezes para as NTs distribuidas ao Italo: uma pelo
+# NATJUS2 (triagem, 18h) e outra pelo Processamento (rascunho da NT, 5-6h do dia
+# seguinte). Cada extracao faz login, baixa todos os anexos e roda OCR — trabalho caro
+# e identico. Guardamos o resultado por NT para a segunda chamada sair de graca.
+#
+#   EXTRACAO_CACHE_DIR  onde gravar (default /tmp/nat_extracao; use um Volume do
+#                       Railway se quiser que sobreviva a deploy)
+#   EXTRACAO_TTL        validade em segundos (default 7 dias; 0 desliga o cache)
+#
+# Extracao ILEGIVEL nao entra no cache — senao um retry nunca reprocessaria.
+EXTRACAO_CACHE_DIR = os.environ.get("EXTRACAO_CACHE_DIR", "/tmp/nat_extracao")
+EXTRACAO_TTL = int(os.environ.get("EXTRACAO_TTL", str(7 * 24 * 3600)))
+
+
+def _cache_caminho(nt):
+    nome = re.sub(r"[^0-9A-Za-z_-]", "", str(nt))
+    return os.path.join(EXTRACAO_CACHE_DIR, nome + ".json")
+
+
+def _cache_ler(nt):
+    if EXTRACAO_TTL <= 0:
+        return None
+    try:
+        caminho = _cache_caminho(nt)
+        if not os.path.exists(caminho):
+            return None
+        with open(caminho) as f:
+            d = json.load(f)
+        idade = time.time() - float(d.get("ts", 0))
+        if idade > EXTRACAO_TTL:
+            return None
+        payload = d.get("payload")
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            payload["cache"] = "hit"
+            payload["cache_idade_s"] = int(idade)
+        return payload
+    except Exception:
+        return None
+
+
+def _cache_gravar(nt, payload):
+    if EXTRACAO_TTL <= 0:
+        return
+    if str((payload or {}).get("legibilidade", "")).lower() == "ilegivel":
+        return  # deixa o retry tentar de novo
+    try:
+        os.makedirs(EXTRACAO_CACHE_DIR, exist_ok=True)
+        with open(_cache_caminho(nt), "w") as f:
+            json.dump({"ts": time.time(), "payload": payload}, f)
+    except Exception:
+        pass
+
+
 def _texto_ruim(t):
     """True se o texto da pagina parece ilegivel: vazio, poucos chars ou lixo de fonte (cid)."""
     if not t or len(t.strip()) < 100:
@@ -609,6 +742,14 @@ def processar():
     nt = request.json.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
+
+    # ?forcar=1 (ou {"forcar": true}) ignora o cache e extrai de novo
+    forcar = (str(request.args.get("forcar", "")) == "1") or bool(request.json.get("forcar"))
+    if not forcar:
+        em_cache = _cache_ler(nt)
+        if em_cache:
+            return jsonify(em_cache)
+
     with _lock_navegador:
         with sync_playwright() as p:
             browser = _launch_browser(p)
@@ -703,7 +844,7 @@ def processar():
         legibilidade = "parcial"
     else:
         legibilidade = "ok"
-    return jsonify({
+    resultado = {
         "numeroNT": nt,
         "texto": texto_total,
         "caracteres": len(texto_total),
@@ -713,8 +854,11 @@ def processar():
         "paginas_ocr": paginas_ocr,
         "pct_ilegivel": pct_ilegivel,
         "legibilidade": legibilidade,
-        "arquivos_links": arquivos_links
-    })
+        "arquivos_links": arquivos_links,
+        "cache": "miss"
+    }
+    _cache_gravar(nt, resultado)
+    return jsonify(resultado)
 def _linha_para_registro(texto, debug):
     """Converte o texto bruto de uma linha da listagem em um registro. None se nao for NT."""
     re_nt        = re.compile(r"\b(\d{6})\b")
@@ -967,84 +1111,85 @@ def conclusao(nt):
 @app.route("/preencher", methods=["POST"])
 def preencher():
     """
-    Preenche o formulário da NT no e-NatJus sem submeter.
-    [FASE 2 — seletores precisam ser calibrados antes do uso real]
+    Preenche os campos de identificacao da NT no e-NatJus e, opcionalmente, salva a tecnologia.
+
+    Corpo:
+      numeroNT                 obrigatorio
+      cid                      codigo CID-10, ex. "N80.9" — a busca do e-NatJus e por codigo
+      diagnostico              texto
+      meios_confirmatorios     texto
+      natjus_responsavel       default "Ceará"
+      instituicao_responsavel  default "TJCE"
+      apoio_tutoria            default "Não"
+      salvar                   default False
+
+    NUNCA clica em 'Salvar e Finalizar Tecnologia'. Finalizar e o que libera o botao
+    'Realizar emissao' — enquanto a tecnologia nao e finalizada, o proprio e-NatJus segura a
+    emissao, e essa trava e o que garante que nenhuma NT saia sem um humano ter lido.
     """
-    dados = request.json
+    dados = request.json or {}
     nt = dados.get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
+
+    salvar = bool(dados.get("salvar", False))
     log = []
-    screenshot_final = None
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context()
-        page    = context.new_page()
+        page = context.new_page()
         try:
             _exigir_sessao(context, page)
-            formulario = _navegar_ate_formulario(context, page, nt)
-            log.append("Formulário localizado")
+            form = _navegar_ate_formulario(context, page, nt)
+            log.append("Formulario da NT localizado")
+
             if dados.get("cid"):
-                ok = _preencher_campo(formulario, "input[name*='cid'], #cid, input[placeholder*='CID']", dados["cid"])
-                log.append(f"CID: {'OK' if ok else 'FALHOU'}")
+                _select_por_rotulo(form, "CID", dados["cid"], log, "CID")
             if dados.get("diagnostico"):
-                ok = _preencher_campo(formulario, "textarea[name*='diagnostico'], #diagnostico", dados["diagnostico"])
-                log.append(f"Diagnóstico: {'OK' if ok else 'FALHOU'}")
+                _texto_por_rotulo(form, "Diagnóstico", dados["diagnostico"], log, "Diagnostico")
             if dados.get("meios_confirmatorios"):
-                ok = _preencher_campo(formulario, "textarea[name*='meios'], textarea[name*='confirmatorio']", dados["meios_confirmatorios"])
-                log.append(f"Meios confirmatórios: {'OK' if ok else 'FALHOU'}")
-            if dados.get("tipo_tecnologia"):
-                ok = _selecionar_opcao(formulario, "select[name*='tipo'], #tipo_tecnologia", dados["tipo_tecnologia"])
-                log.append(f"Tipo de tecnologia: {'OK' if ok else 'FALHOU'}")
-            if dados.get("outras_tecnologias"):
-                ok = _preencher_campo(formulario, "textarea[name*='outras_tecnologias'], textarea[name*='alternativas']", dados["outras_tecnologias"])
-                log.append(f"Outras tecnologias: {'OK' if ok else 'FALHOU'}")
-            if dados.get("custo_tecnologia"):
-                ok = _preencher_campo(formulario, "textarea[name*='custo']", dados["custo_tecnologia"])
-                log.append(f"Custo: {'OK' if ok else 'FALHOU'}")
-            if dados.get("fonte_custo"):
-                ok = _preencher_campo(formulario, "textarea[name*='fonte']", dados["fonte_custo"])
-                log.append(f"Fonte do custo: {'OK' if ok else 'FALHOU'}")
-            if dados.get("evidencias"):
-                ok = _preencher_campo(formulario, "textarea[name*='evidencia'], textarea[name*='eficacia']", dados["evidencias"])
-                log.append(f"Evidências: {'OK' if ok else 'FALHOU'}")
-            if dados.get("beneficio_esperado"):
-                ok = _preencher_campo(formulario, "textarea[name*='beneficio'], textarea[name*='resultado']", dados["beneficio_esperado"])
-                log.append(f"Benefício esperado: {'OK' if ok else 'FALHOU'}")
-            if dados.get("recomendacao_conitec"):
-                ok = _selecionar_opcao(formulario, "select[name*='conitec'], select[name*='recomendacao']", dados["recomendacao_conitec"])
-                log.append(f"Recomendação CONITEC: {'OK' if ok else 'FALHOU'}")
-            if dados.get("conclusao_favoravel"):
-                ok = _selecionar_opcao(formulario, "select[name*='favoravel'], select[name*='conclusao_select']", dados["conclusao_favoravel"])
-                log.append(f"Conclusão (favorável/não): {'OK' if ok else 'FALHOU'}")
-            if dados.get("conclusao"):
-                ok = _preencher_campo(formulario, "textarea[name*='conclusao']", dados["conclusao"])
-                log.append(f"Conclusão (texto): {'OK' if ok else 'FALHOU'}")
-            if dados.get("ha_evidencias"):
-                ok = _selecionar_opcao(formulario, "select[name*='evidencias_select'], select[name*='ha_evidencia']", dados["ha_evidencias"])
-                log.append(f"Há evidências: {'OK' if ok else 'FALHOU'}")
-            if dados.get("urgencia"):
-                ok = _selecionar_opcao(formulario, "select[name*='urgencia']", dados["urgencia"])
-                log.append(f"Urgência: {'OK' if ok else 'FALHOU'}")
-            if dados.get("referencias"):
-                ok = _preencher_campo(formulario, "textarea[name*='referencia'], textarea[name*='bibliograf']", dados["referencias"])
-                log.append(f"Referências: {'OK' if ok else 'FALHOU'}")
-            natjus = dados.get("natjus_responsavel", "CE")
-            ok = _selecionar_opcao(formulario, "select[name*='natjus'], select[name*='responsavel']", natjus)
-            log.append(f"NatJus responsável ({natjus}): {'OK' if ok else 'FALHOU'}")
-            if dados.get("instituicao_responsavel"):
-                ok = _preencher_campo(formulario, "input[name*='instituicao'], #instituicao", dados["instituicao_responsavel"])
-                log.append(f"Instituição: {'OK' if ok else 'FALHOU'}")
+                _texto_por_rotulo(form, "confirmatório", dados["meios_confirmatorios"],
+                                  log, "Meios confirmatorios")
+
+            natjus = dados.get("natjus_responsavel", "Ceará")
+            _select_por_rotulo(form, "NatJus Responsável", natjus, log, "NatJus responsavel")
+
+            inst = dados.get("instituicao_responsavel", "TJCE")
+            _texto_por_rotulo(form, "Instituição Responsável", inst, log, "Instituicao responsavel")
+
             tutoria = dados.get("apoio_tutoria", "Não")
-            ok = _selecionar_opcao(formulario, "select[name*='tutoria']", tutoria)
-            log.append(f"Apoio tutoria ({tutoria}): {'OK' if ok else 'FALHOU'}")
-            if dados.get("outras_informacoes"):
-                ok = _preencher_campo(formulario, "textarea[name*='outras_info'], textarea[name*='outras_informacoes']", dados["outras_informacoes"])
-                log.append(f"Outras informações: {'OK' if ok else 'FALHOU'}")
-            screenshot_final = _screenshot_b64(formulario)
-            log.append("Formulário preenchido — NÃO submetido (aguardando aprovação manual)")
+            _select_por_rotulo(form, "apoio de tutoria", tutoria, log, "Apoio de tutoria")
+
+            antes = _screenshot_b64(form)
+
+            salvo = False
+            if salvar:
+                try:
+                    botao = form.locator("button:has-text('Salvar Tecnologia'), "
+                                         "a:has-text('Salvar Tecnologia'), "
+                                         "input[value='Salvar Tecnologia']").first
+                    botao.wait_for(state="visible", timeout=8000)
+                    botao.click()
+                    form.wait_for_load_state("networkidle", timeout=30000)
+                    salvo = True
+                    log.append("Tecnologia salva (botao 'Salvar Tecnologia')")
+                except Exception as e:
+                    log.append(f"Salvar tecnologia: FALHOU ({type(e).__name__}: {str(e)[:90]})")
+            else:
+                log.append("NAO salvo — chamada de conferencia (salvar=false)")
+
+            depois = _screenshot_b64(form)
+            falhas = [l for l in log if "FALHOU" in l or "GRAVOU DIFERENTE" in l]
             browser.close()
-            return jsonify({"sucesso": True, "numeroNT": nt, "log": log, "screenshot": screenshot_final})
+            return jsonify({
+                "sucesso": len(falhas) == 0,
+                "numeroNT": nt,
+                "salvo": salvo,
+                "falhas": falhas,
+                "log": log,
+                "screenshot": depois,
+                "screenshot_antes_de_salvar": antes if salvar else None
+            })
         except Exception as e:
             sc = _screenshot_b64(page)
             try:
@@ -1052,6 +1197,7 @@ def preencher():
             except Exception:
                 pass
             return jsonify({"erro": str(e), "log": log, "screenshot": sc}), 500
+
 # ─────────────────────────────────────────────
 # Rota [LEGADO] — extrai texto de um PDF em base64
 # ─────────────────────────────────────────────
