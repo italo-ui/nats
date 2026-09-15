@@ -120,6 +120,24 @@ def _set_cached_cookies(cookies):
     _persist_cookies(cookies)
 
 
+def _renovar_sessao(context):
+    """
+    TTL DESLIZANTE (15/09/2026). Chamado depois de toda navegacao que confirmou
+    'logado'. Antes, o carimbo do cache so era renovado no login: com o TTL fixo
+    de 25 min, um lote de 3h40 (levantamento do historico) refazia login ~9 vezes
+    por noite. Agora, enquanto o portal continua aceitando a sessao, o cache e
+    renovado a cada uso e o login acontece UMA vez por lote. Se o portal derrubar
+    a sessao, a autocura de _navegar_direto/_navegar_via_listagem/listar reloga
+    uma vez, como antes.
+    Regrava tambem os cookies atuais do contexto: o portal pode rotacionar o id
+    de sessao, e manter a versao antiga levaria a um relogin desnecessario.
+    """
+    try:
+        _set_cached_cookies(context.cookies())
+    except Exception:
+        pass
+
+
 def _invalidate_cookies():
     global _cookies_cache, _cookies_ts
     with _cookies_lock:
@@ -245,6 +263,7 @@ def _navegar_direto(context, page, nt):
             page.wait_for_load_state("networkidle", timeout=30000)
         if not _check_logged_in(page):
             raise Exception("Sessão expirada ou cookies inválidos")
+    _renovar_sessao(context)  # TTL deslizante: sessao confirmada, renova o cache
     if "notaTecnica-solicitacao-listar" in page.url:
         raise Exception(f"NT {nt} não encontrada — redirecionado para listagem")
     _aguardar_conteudo(page)
@@ -259,6 +278,7 @@ def _navegar_via_listagem(context, page, nt):
             page.wait_for_load_state("networkidle", timeout=30000)
         if not _check_logged_in(page):
             raise Exception("Sessão expirada ou cookies inválidos")
+    _renovar_sessao(context)  # TTL deslizante
     linha = page.locator(f"tr:has-text('{nt}')").first
     if linha.count() == 0:
         raise Exception(f"NT {nt} não encontrada na listagem")
@@ -983,6 +1003,7 @@ def listar():
                         browser.close()
                         return jsonify({"erro": "Sessão expirada ou cookies inválidos",
                                         "screenshot": sc}), 401
+                _renovar_sessao(context)  # TTL deslizante
 
                 # espera a tabela montar
                 try:
@@ -1124,6 +1145,149 @@ def conclusao(nt):
                 except Exception:
                     pass
                 return jsonify({"erro": str(e), "numeroNT": str(nt), "screenshot": sc}), 500
+
+
+# ─────────────────────────────────────────────
+# Rota [LEITURA] — despeja a NT inteira, numa carga de página só
+# ─────────────────────────────────────────────
+# Existe para o levantamento do histórico: 3,4 mil NTs a ~20 s de carga cada, em fila única
+# por causa do _lock_navegador. Duas chamadas por NT dobrariam um trabalho de 14 horas, então
+# esta rota lê TUDO de uma vez: cabeçalho, conclusão, campos do formulário e os CKEditor.
+#
+# Ela NÃO mapeia rótulo -> coluna de planilha, de propósito. Devolve a lista crua de campos
+# com o rótulo do lado, e quem consome decide o que fazer. Mapear aqui significaria um deploy
+# do Railway a cada ajuste de nome de coluna; mapear fora é editar um nó de código.
+_JS_LER_NT = r"""
+() => {
+  const txt = e => (e ? (e.innerText || e.textContent || '') : '').replace(/\s+/g, ' ').trim();
+  const out = { titulo: '', conclusao_valor: '', conclusao_texto: '',
+                ver_nota: '', tabela: [], campos: [], ricos: {}, avisos: [] };
+
+  const h = document.querySelector('h1, h2, h3, .page-header');
+  out.titulo = txt(h);
+
+  // A tabela do cabeçalho é a única com 'Conclusão' E 'Tecnologia' na primeira linha.
+  // Procurar pela posição na página quebraria em qualquer redesenho.
+  for (const t of document.querySelectorAll('table')) {
+    const cab = Array.from(t.querySelectorAll('thead th, thead td, tr:first-child th, tr:first-child td')).map(txt);
+    if (cab.some(c => /Conclus/i.test(c)) && cab.some(c => /Tecnologia/i.test(c))) {
+      for (const tr of t.querySelectorAll('tbody tr, tr')) {
+        const cels = Array.from(tr.querySelectorAll('td')).map(txt);
+        if (!cels.length) continue;
+        const a = tr.querySelector('a[href]');
+        out.tabela.push({ celulas: cels, link: a ? a.href : '' });
+        if (a && /Ver\s*Nota/i.test(txt(a)) && !out.ver_nota) out.ver_nota = a.href;
+      }
+      break;
+    }
+  }
+
+  const sc = document.getElementById('selConclusao');
+  if (sc) {
+    out.conclusao_valor = sc.value || '';
+    const op = sc.options[sc.selectedIndex];
+    out.conclusao_texto = op ? txt(op) : '';
+  } else {
+    out.avisos.push('selConclusao ausente');
+  }
+
+  // Os campos ricos são CKEditor. O <textarea> original existe no DOM mas só é
+  // sincronizado no submit — ler o textarea devolve vazio ou desatualizado, e em silêncio.
+  try {
+    if (window.CKEDITOR && CKEDITOR.instances) {
+      for (const k in CKEDITOR.instances) {
+        try { out.ricos[k] = CKEDITOR.instances[k].getData() || ''; }
+        catch (e) { out.avisos.push('CKEDITOR ' + k + ': ' + e.message); }
+      }
+    } else {
+      out.avisos.push('CKEDITOR nao encontrado na pagina');
+    }
+  } catch (e) { out.avisos.push('CKEDITOR: ' + e.message); }
+
+  document.querySelectorAll('.form-group').forEach(g => {
+    const lab = g.querySelector('label');
+    const rotulo = txt(lab).replace(/\s*\*\s*$/, '');
+    g.querySelectorAll('input, select, textarea').forEach(c => {
+      const tag = c.tagName.toLowerCase();
+      if (c.type === 'hidden' && !c.value) return;
+      if ((c.type === 'radio' || c.type === 'checkbox') && !c.checked) return;
+      const item = { rotulo: rotulo, tag: tag, tipo: c.type || '',
+                     name: c.name || '', id: c.id || '', valor: '' };
+      if (tag === 'select') {
+        const op = c.options[c.selectedIndex];
+        item.valor = op ? txt(op) : (c.value || '');
+        item.valor_bruto = c.value || '';
+      } else if (c.type === 'radio' || c.type === 'checkbox') {
+        item.valor = c.value || 'on';
+      } else {
+        item.valor = c.value || '';
+        if (tag === 'textarea' && out.ricos[item.name] !== undefined) item.valor = out.ricos[item.name];
+      }
+      out.campos.push(item);
+    });
+  });
+
+  return out;
+}
+"""
+
+
+@app.route("/nt/<nt>", methods=["GET"])
+def nt_completa(nt):
+    """
+    SOMENTE LEITURA. Abre a página da NT e devolve tudo o que ela mostra.
+
+    Nao clica em nada, nao preenche, nao salva. Pensada para varredura em massa.
+
+    Parametro opcional:
+      ?captura=1  -> inclui a captura de tela em base64. NAO use em lote: sao ~350 KB por NT.
+
+    Resposta (200):
+      { numeroNT, url, titulo, conclusao_valor, conclusao_texto, ver_nota,
+        tabela: [{celulas, link}], campos: [{rotulo, tag, tipo, name, id, valor, valor_bruto?}],
+        ricos: {nome_do_campo: html}, avisos: [], erro: "" }
+
+    Em falha devolve 500 com {erro, numeroNT} — e, se ?captura=1, a tela. O consumidor deve
+    usar onError continueRegularOutput, como o no 12 do NATJUS1 ja faz com /conclusao.
+    """
+    quer_captura = request.args.get("captura") == "1"
+    with _lock_navegador:
+        with sync_playwright() as p:
+            browser = _launch_browser(p)
+            context = browser.new_context()
+            page = context.new_page()
+            try:
+                _exigir_sessao(context, page)
+                # De proposito NAO usa _navegar_ate_formulario: aquela funcao exige o texto
+                # 'Diagnostico Principal' e levanta excecao se ele nao aparecer. Numa varredura
+                # de 3,4 mil registros heterogeneos, isso jogaria fora paginas que tem metade
+                # do que interessa. Aqui a espera e mole: se a aba nao montar, segue e avisa.
+                pagina = _navegar_ate_pagina_nt(context, page, nt)
+                aviso_forma = ""
+                try:
+                    pagina.wait_for_selector("text=Diagnóstico Principal", timeout=15000)
+                except Exception:
+                    aviso_forma = "aba da tecnologia nao apareceu em 15s; leitura pode estar incompleta"
+
+                dados = pagina.evaluate(_JS_LER_NT)
+                if aviso_forma:
+                    dados.setdefault("avisos", []).append(aviso_forma)
+                dados["numeroNT"] = str(nt)
+                dados["url"] = pagina.url
+                dados["erro"] = ""
+                if quer_captura:
+                    dados["screenshot"] = _screenshot_b64(pagina)
+                browser.close()
+                return jsonify(dados)
+            except Exception as e:
+                sc = _screenshot_b64(page) if quer_captura else ""
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+                return jsonify({"numeroNT": str(nt), "erro": str(e),
+                                "campos": [], "ricos": {}, "tabela": [],
+                                "avisos": [], "screenshot": sc}), 500
 
 
 # ─────────────────────────────────────────────
