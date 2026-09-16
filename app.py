@@ -16,8 +16,14 @@ except Exception:
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 app = Flask(__name__)
-import threading
+import threading, gc
 _lock_navegador = threading.Lock()
+# LOCK DE OCR (16/09/2026). O _lock_navegador so cobre a navegacao; o download e o OCR do
+# /processar rodavam FORA dele, e duas chamadas simultaneas (duas rodadas do NATJUS2) faziam
+# dois OCRs a 300 dpi ao mesmo tempo, ao lado de um Chromium — foi o que derrubou o servico por
+# falta de memoria em 16/09. Este lock serializa a fase de download+OCR entre chamadas do
+# /processar, sem segurar o navegador (um /nt do historico pode rodar enquanto o OCR trabalha).
+_lock_ocr = threading.Lock()
 ENATJUS_BASE = "https://www.pje.jus.br/e-natjus"
 LOGIN_URL     = f"{ENATJUS_BASE}/index.php"
 LISTA_URL     = f"{ENATJUS_BASE}/notaTecnica-solicitacao-listar.php"
@@ -758,15 +764,31 @@ def _preprocess(img):
         return g.point(lambda p: 255 if p > thr else 0)
     except Exception:
         return g
-def _ocr_pagina(doc_fitz, indice, dpi=300):
-    """Renderiza a pagina em alta resolucao, pre-processa e roda OCR (portugues)."""
+def _ocr_pagina(doc_fitz, indice, dpi=220):
+    """Renderiza a pagina, pre-processa e roda OCR (portugues).
+
+    MEMORIA (16/09/2026): antes renderizava em RGB a 300 dpi, codificava em PNG e decodificava
+    de novo com PIL — tres copias de uma imagem de ~25 MB por pagina. Agora renderiza direto em
+    CINZA a 220 dpi (o Tesseract le bem a partir de ~200) e monta a imagem PIL a partir dos
+    bytes crus, sem PNG. Cerca de 6x menos memoria por pagina, e libera tudo ao sair.
+    """
     if fitz is None or pytesseract is None or Image is None:
         return ""
     page = doc_fitz.load_page(indice)
-    pix = page.get_pixmap(dpi=dpi)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    img = _preprocess(img)
-    return pytesseract.image_to_string(img, lang="por", config="--oem 1 --psm 6") or ""
+    pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csGRAY, alpha=False)
+    try:
+        img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+    finally:
+        pix = None
+    try:
+        img = _preprocess(img)
+        return pytesseract.image_to_string(img, lang="por", config="--oem 1 --psm 6") or ""
+    finally:
+        try:
+            img.close()
+        except Exception:
+            pass
+        page = None
 @app.route("/processar", methods=["POST"])
 def processar():
     """
@@ -823,22 +845,32 @@ def processar():
     MAX_PAGINAS_OCR = 30      # teto de paginas que farao OCR
     OCR_TIME_BUDGET = 150     # segundos: para de fazer OCR depois disso (margem p/ timeout)
     t_inicio = time.time()
-    # 1) baixa o conteudo de cada arquivo
-    baixados = []
-    for idx, info in enumerate(hashes_validos[:5]):
+    # Download + OCR serializados entre chamadas do /processar (ver _lock_ocr no topo).
+    _lock_ocr.acquire()
+    try:
+      # 1) baixa o conteudo de cada arquivo
+      baixados = []
+      for idx, info in enumerate(hashes_validos[:5]):
         try:
             conteudo, _ct = _baixar_arquivo(info["hash"], cookies)
             baixados.append((idx, conteudo))
         except Exception as e:
             texto_total += f"\n[erro ao baixar arquivo {idx+1}: {e}]\n"
-    # 2) menor -> maior (gasta o orcamento de OCR nos arquivos menores primeiro)
-    baixados.sort(key=lambda x: len(x[1]))
-    for idx, conteudo in baixados:
+      # 2) menor -> maior (gasta o orcamento de OCR nos arquivos menores primeiro)
+      baixados.sort(key=lambda x: len(x[1]))
+      # Consome a lista tirando cada arquivo dela: o conteudo ja processado e liberado
+      # antes de abrir o proximo, em vez de ficar tudo em memoria ate o fim.
+      while baixados:
+        idx, conteudo = baixados.pop(0)
         try:
             textos = []
             with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
                 for pg in pdf.pages:
                     textos.append(pg.extract_text() or "")
+                    try:
+                        pg.flush_cache()
+                    except Exception:
+                        pass
             doc_fitz = None
             for i, txt_pagina in enumerate(textos):
                 paginas_total += 1
@@ -866,6 +898,13 @@ def processar():
             arquivos += 1
         except Exception as e:
             texto_total += f"\n[erro ao ler arquivo: {e}]\n"
+        finally:
+            conteudo = None
+            textos = None
+            doc_fitz = None
+            gc.collect()
+    finally:
+        _lock_ocr.release()
     texto_total = texto_total.strip()
     # links diretos de download de cada arquivo no e-NatJus (sem trazer o PDF pro n8n)
     arquivos_links = [
