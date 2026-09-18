@@ -1,5 +1,6 @@
 import os, time, base64, json, subprocess, urllib.request, urllib.error, re
 import io
+import hmac, functools
 try:
     import pymupdf as fitz  # PyMuPDF >= 1.24 (nome novo)
 except Exception:
@@ -24,6 +25,53 @@ _lock_navegador = threading.Lock()
 # falta de memoria em 16/09. Este lock serializa a fase de download+OCR entre chamadas do
 # /processar, sem segurar o navegador (um /nt do historico pode rodar enquanto o OCR trabalha).
 _lock_ocr = threading.Lock()
+
+# ============================================================
+# AUTENTICACAO DAS ROTAS (18/09/2026, revisao)
+# ------------------------------------------------------------
+# Ate aqui todas as rotas eram publicas, inclusive /preencher (a unica que ESCREVE no
+# e-NatJus), /login e /processar (OCR caro). Quem descobrisse a URL preenchia NTs ou
+# derrubava o servico.
+#   NAT_API_KEY (Railway > Variables): se definida, toda rota exceto "/" exige o header
+#       X-Nat-Key: <valor>        (ou Authorization: Bearer <valor>)
+#   Se NAO definida, o servico continua aberto como antes (compatibilidade com o n8n ate a
+#   credencial existir la); a resposta de "/" avisa que a chave esta desligada.
+# No n8n: credencial "Header Auth" (Name = X-Nat-Key, Value = a chave) em cada no HTTP que
+# chama o Railway — mesmo modelo ja usado para a chave do Gemini.
+# ============================================================
+NAT_API_KEY = os.environ.get("NAT_API_KEY", "").strip()
+
+
+@app.before_request
+def _exigir_chave():
+    if request.path == "/" or request.method == "OPTIONS":
+        return None
+    if not NAT_API_KEY:
+        return None
+    enviada = (request.headers.get("X-Nat-Key") or "").strip()
+    if not enviada:
+        auth = request.headers.get("Authorization", "") or ""
+        if auth.lower().startswith("bearer "):
+            enviada = auth[7:].strip()
+    if not enviada or not hmac.compare_digest(enviada, NAT_API_KEY):
+        return jsonify({"erro": "nao autorizado: header X-Nat-Key ausente ou invalido"}), 401
+    return None
+
+
+def _serializado(fn):
+    """Roda a rota inteira sob _lock_navegador: UM Chromium por vez em todo o servico.
+
+    (18/09/2026) /preencher, /campos, /diagnostico, /login e /teste abriam o navegador fora
+    da trava — a regra de sessao unica valia so para /processar, /listar, /conclusao e /nt.
+    Dois Chromium ao lado de um OCR foi o que derrubou o servico por memoria em 16/09.
+    """
+    @functools.wraps(fn)
+    def _envolvida(*args, **kwargs):
+        with _lock_navegador:
+            return fn(*args, **kwargs)
+    return _envolvida
+
+
 ENATJUS_BASE = "https://www.pje.jus.br/e-natjus"
 LOGIN_URL     = f"{ENATJUS_BASE}/index.php"
 LISTA_URL     = f"{ENATJUS_BASE}/notaTecnica-solicitacao-listar.php"
@@ -350,15 +398,45 @@ def _extrair_hashes(pagina_nt):
     except Exception as e:
         hashes.append({"erro": str(e)})
     return hashes
-def _baixar_arquivo(hash_val, cookie_str):
+# 18/09/2026: teto por anexo. A NT 576675 (autos federais grandes) derrubou o Railway por
+# memoria (502). Acima do teto o arquivo nao e nem baixado inteiro: a leitura e interrompida e
+# o anexo entra no texto como ignorado, para a triagem manual decidir.
+MAX_ARQUIVO_MB = int(os.environ.get("MAX_ARQUIVO_MB", "60"))
+
+
+class ArquivoGrandeDemais(Exception):
+    pass
+
+
+def _baixar_arquivo(hash_val, cookie_str, max_bytes=None):
     url = DOWNLOAD_URL.format(hash=hash_val)
     req = urllib.request.Request(url)
     req.add_header("Cookie", cookie_str)
     req.add_header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     req.add_header("Referer", ENATJUS_BASE + "/")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        conteudo = resp.read()
+    # 17/09/2026: 90 s por arquivo (era 60) — o n8n agora espera 4 min pela chamada inteira.
+    with urllib.request.urlopen(req, timeout=90) as resp:
         content_type = resp.headers.get("Content-Type", "")
+        if max_bytes:
+            try:
+                declarado = int(resp.headers.get("Content-Length") or 0)
+            except Exception:
+                declarado = 0
+            if declarado > max_bytes:
+                raise ArquivoGrandeDemais(f"{declarado / 1048576:.0f} MB, acima do teto de {max_bytes // 1048576} MB")
+            partes = []
+            lidos = 0
+            while True:
+                bloco = resp.read(1048576)
+                if not bloco:
+                    break
+                lidos += len(bloco)
+                if lidos > max_bytes:
+                    raise ArquivoGrandeDemais(f"mais de {max_bytes // 1048576} MB")
+                partes.append(bloco)
+            conteudo = b"".join(partes)
+        else:
+            conteudo = resp.read()
     return conteudo, content_type
 def _selecionar_opcao(page, seletor, valor):
     """Seleciona uma opção em um <select> pelo valor ou texto visível."""
@@ -516,8 +594,9 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return "OK", 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-18"}), 200
 @app.route("/teste", methods=["GET"])
+@_serializado
 def teste():
     try:
         result = subprocess.run(
@@ -561,6 +640,7 @@ def teste():
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 @app.route("/login", methods=["GET"])
+@_serializado
 def login():
     """Forca uma (re)autenticacao automatica e reporta o estado da sessao."""
     with sync_playwright() as p:
@@ -590,6 +670,7 @@ def login():
             browser.close()
             return jsonify({"erro": str(e), "screenshot": sc}), 500
 @app.route("/diagnostico/<nt>", methods=["GET"])
+@_serializado
 def diagnostico(nt):
     with sync_playwright() as p:
         browser = _launch_browser(p)
@@ -681,6 +762,17 @@ def baixar():
 # Extracao ILEGIVEL nao entra no cache — senao um retry nunca reprocessaria.
 EXTRACAO_CACHE_DIR = os.environ.get("EXTRACAO_CACHE_DIR", "/tmp/nat_extracao")
 EXTRACAO_TTL = int(os.environ.get("EXTRACAO_TTL", str(7 * 24 * 3600)))
+
+# 18/09/2026: ORCAMENTO TOTAL do /processar, contado desde a chegada da requisicao (login,
+# navegacao, download e OCR), e nao so a partir do download. O n8n espera 240 s; com 170 s
+# sobra folga para a resposta e para a espera pela trava do navegador. A NT 577659 (23 paginas
+# de OCR) estourava 3 x 240 s porque o relogio so comecava depois da navegacao.
+PROCESSAR_ORCAMENTO_S = int(os.environ.get("PROCESSAR_ORCAMENTO_S", "170"))
+
+# 18/09/2026: chamada REPETIDA da mesma NT (retry do n8n enquanto a primeira ainda roda)
+# espera a em curso terminar e devolve o cache, em vez de baixar e fazer OCR de novo.
+_em_curso = {}
+_em_curso_lock = threading.Lock()
 
 
 def _cache_caminho(nt):
@@ -795,17 +887,19 @@ def processar():
     [PRINCIPAL] Baixa o PDF da NT E extrai o texto, tudo internamente.
     Devolve SÓ o texto (leve) — o n8n nunca recebe o arquivo pesado.
     Mede a legibilidade (ok / parcial / ilegivel) para a triagem decidir.
+    18/09/2026: orcamento total desde o inicio, espera pela chamada em curso da mesma NT,
+    teto por anexo (MAX_ARQUIVO_MB) e aviso de anexos alem do 5o. O trabalho em si esta em
+    _processar_nt(); esta funcao cuida do cache e da fila por NT.
     """
-    import io
     try:
-        import pdfplumber
+        import pdfplumber  # noqa: F401
     except ImportError:
         subprocess.run(["pip", "install", "pdfplumber", "-q"], check=True)
-        import pdfplumber
-    nt = request.json.get("numeroNT")
+    nt = (request.json or {}).get("numeroNT")
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
 
+    t_inicio = time.time()  # 18/09/2026: o orcamento conta desde ja
     # ?forcar=1 (ou {"forcar": true}) ignora o cache e extrai de novo
     forcar = (str(request.args.get("forcar", "")) == "1") or bool(request.json.get("forcar"))
     if not forcar:
@@ -813,6 +907,32 @@ def processar():
         if em_cache:
             return jsonify(em_cache)
 
+    # 18/09/2026: se esta NT ja esta sendo processada por outra chamada, espera e devolve o cache.
+    with _em_curso_lock:
+        evento_alheio = _em_curso.get(str(nt))
+        if evento_alheio is None:
+            evento_meu = threading.Event()
+            _em_curso[str(nt)] = evento_meu
+        else:
+            evento_meu = None
+    if evento_meu is None:
+        evento_alheio.wait(timeout=max(10, PROCESSAR_ORCAMENTO_S + 40))
+        em_cache = _cache_ler(nt)
+        if em_cache:
+            em_cache["cache"] = "hit (aguardou a chamada em curso)"
+            return jsonify(em_cache)
+        return jsonify({"erro": "extracao desta NT ainda em curso em outra chamada; tente de novo", "numeroNT": nt}), 503
+    try:
+        return _processar_nt(nt, t_inicio)
+    finally:
+        with _em_curso_lock:
+            _em_curso.pop(str(nt), None)
+        evento_meu.set()
+
+
+def _processar_nt(nt, t_inicio):
+    import io
+    import pdfplumber
     with _lock_navegador:
         with sync_playwright() as p:
             browser = _launch_browser(p)
@@ -842,18 +962,31 @@ def processar():
     paginas_total = 0
     paginas_ilegiveis = 0
     paginas_ocr = 0
-    MAX_PAGINAS_OCR = 30      # teto de paginas que farao OCR
-    OCR_TIME_BUDGET = 150     # segundos: para de fazer OCR depois disso (margem p/ timeout)
-    t_inicio = time.time()
+    # 17/09/2026: janela do n8n subiu de 3 para 4 min (no 05 do NATJUS2 e 04 do Processamento).
+    # 18/09/2026: o orcamento e TOTAL (PROCESSAR_ORCAMENTO_S, desde a chegada da requisicao) e
+    # vale para download e OCR; t_inicio vem de processar().
+    MAX_PAGINAS_OCR = 40      # teto de paginas que farao OCR
+    OCR_TIME_BUDGET = PROCESSAR_ORCAMENTO_S
+    avisos = []
+    anexos_total = len(hashes_validos)
+    if anexos_total > 5:
+        avisos.append(f"A NT tem {anexos_total} anexos; so os 5 primeiros foram lidos.")
     # Download + OCR serializados entre chamadas do /processar (ver _lock_ocr no topo).
     _lock_ocr.acquire()
     try:
       # 1) baixa o conteudo de cada arquivo
       baixados = []
       for idx, info in enumerate(hashes_validos[:5]):
+        if (time.time() - t_inicio) >= OCR_TIME_BUDGET:
+            avisos.append(f"Arquivo {idx+1} nao foi baixado: orcamento de tempo esgotado.")
+            texto_total += f"\n[arquivo {idx+1} nao baixado: orcamento de tempo esgotado]\n"
+            continue
         try:
-            conteudo, _ct = _baixar_arquivo(info["hash"], cookies)
+            conteudo, _ct = _baixar_arquivo(info["hash"], cookies, max_bytes=MAX_ARQUIVO_MB * 1048576)
             baixados.append((idx, conteudo))
+        except ArquivoGrandeDemais as e:
+            avisos.append(f"Arquivo {idx+1} ignorado: {e}.")
+            texto_total += f"\n[arquivo {idx+1} ignorado: {e} — leitura manual necessaria]\n"
         except Exception as e:
             texto_total += f"\n[erro ao baixar arquivo {idx+1}: {e}]\n"
       # 2) menor -> maior (gasta o orcamento de OCR nos arquivos menores primeiro)
@@ -924,16 +1057,23 @@ def processar():
         legibilidade = "parcial"
     else:
         legibilidade = "ok"
+    if avisos:
+        # a triagem (Claude) le o texto inteiro: o aviso no fim do texto vira pendencia na NT.
+        texto_total += "\n\n[AVISO DO SISTEMA: " + " ".join(avisos) + "]\n"
     resultado = {
         "numeroNT": nt,
         "texto": texto_total,
         "caracteres": len(texto_total),
         "arquivos": arquivos,
+        "anexos_total": anexos_total,
+        "anexos_ignorados": max(0, anexos_total - arquivos),
+        "avisos": avisos,
         "paginas_total": paginas_total,
         "paginas_ilegiveis": paginas_ilegiveis,
         "paginas_ocr": paginas_ocr,
         "pct_ilegivel": pct_ilegivel,
         "legibilidade": legibilidade,
+        "tempo_s": round(time.time() - t_inicio, 1),
         "arquivos_links": arquivos_links,
         "cache": "miss"
     }
@@ -1333,6 +1473,7 @@ def nt_completa(nt):
 # Rota [FASE 2] — preenche o formulário da NT (sem submeter)
 # ─────────────────────────────────────────────
 @app.route("/campos/<nt>", methods=["GET"])
+@_serializado
 def campos(nt):
     """
     Despeja todo campo do formulario da NT: rotulo, tag, tipo, name, id, classes e, para os
@@ -1386,6 +1527,7 @@ def campos(nt):
 
 
 @app.route("/preencher", methods=["POST"])
+@_serializado
 def preencher():
     """
     Preenche os campos de identificacao da NT no e-NatJus e, opcionalmente, salva a tecnologia.
@@ -1514,6 +1656,9 @@ def comprimir():
         })
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
