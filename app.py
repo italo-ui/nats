@@ -609,7 +609,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20b"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -1773,7 +1773,8 @@ def _texto_de_html(h):
     t = re.sub(r"<\s*br\s*/?>", "\n", str(h or ""), flags=re.IGNORECASE)
     t = re.sub(r"</\s*(p|div|li|tr|h\d)\s*>", "\n", t, flags=re.IGNORECASE)
     t = re.sub(r"<[^>]+>", "", t)
-    t = t.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    import html as _html
+    t = _html.unescape(t).replace("\xa0", " ")
     return re.sub(r"[ \t]+", " ", t).strip()
 
 
@@ -1855,7 +1856,7 @@ def _preencher_select_id(pagina, id_campo, valor, log, nome):
         return {"status": "FALHOU", "motivo": str(e)[:120]}
 
 
-def _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato=True):
+def _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato=True, contexto=""):
     """Combobox select2 com busca remota (principio ativo, nome comercial, procedimento).
     Abre o widget, digita, lista TODAS as opcoes devolvidas e escolhe a que casa exatamente com o
     valor (normalizado). Sem casamento exato: com exigir_exato=True devolve AMBIGUO/SEM_RESULTADO
@@ -1889,15 +1890,29 @@ def _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato=True)
             pagina.keyboard.press("Escape")
             log.append(f"{nome}: SEM_RESULTADO (busca por '{alvo[:40]}')")
             return {"status": "SEM_RESULTADO", "candidatos": []}
+        # As listas do e-NatJus vem como 'NOME | COMPLEMENTO' (ex.: 'JAKAVI | FOSFATO DE RUXOLITINIBE').
+        # Casa pelo texto inteiro, depois pelo primeiro segmento; empate de segmento desempata pelo
+        # contexto (o principio ativo ja escolhido no txtDcb), senao fica AMBIGUO.
+        def seg1(c):
+            return _norm_txt(c.split("|")[0])
         exatos = [c for c in cands if _norm_txt(c) == _norm_txt(alvo)]
+        por_seg = [c for c in cands if seg1(c) == _norm_txt(alvo)]
         escolhida = None
         aproximado = False
         if exatos:
             escolhida = exatos[0]
-        elif len(cands) == 1:
+        elif len(por_seg) == 1:
+            escolhida = por_seg[0]
+            aproximado = True
+        elif len(por_seg) > 1 and contexto:
+            com_ctx = [c for c in por_seg if _norm_txt(contexto) and _norm_txt(contexto) in _norm_txt(c)]
+            if len(com_ctx) == 1:
+                escolhida = com_ctx[0]
+                aproximado = True
+        if escolhida is None and len(cands) == 1:
             escolhida = cands[0]
             aproximado = _norm_txt(cands[0]) != _norm_txt(alvo)
-        elif not exigir_exato:
+        if escolhida is None and not exigir_exato:
             escolhida = cands[0]
             aproximado = True
         if escolhida is None:
@@ -2097,7 +2112,10 @@ def preencher_nt():
                     r = _preencher_select_id(form, id_campo, valor, log, nome)
                     form.wait_for_timeout(300)   # deixa o JS do e-NatJus mostrar/esconder dependentes
                 elif tipo == "select2":
-                    r = _preencher_select2_id(form, id_campo, valor, log, nome, exigir_exato)
+                    ctx = ""
+                    if id_campo == "txtDcbComercial":
+                        ctx = str((resultado.get("txtDcb") or {}).get("lido") or campos.get("txtDcb") or "")
+                    r = _preencher_select2_id(form, id_campo, valor, log, nome, exigir_exato, ctx)
                 elif tipo == "ckeditor":
                     r = _preencher_ckeditor_id(form, id_campo, valor, log, nome)
                 else:
