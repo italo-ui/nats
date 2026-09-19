@@ -72,6 +72,21 @@ def _serializado(fn):
     return _envolvida
 
 
+class ServicoOcupado(Exception):
+    pass
+
+
+def _adquirir(lock, t_inicio, orcamento, nome):
+    """(19/09/2026) Espera pelo lock so enquanto sobrar orcamento. Antes, uma chamada que o n8n
+    ja tinha abandonado por timeout continuava rodando aqui e segurava _lock_ocr por minutos;
+    as chamadas seguintes esperavam, gastavam o orcamento na fila e devolviam 'nenhum anexo
+    baixado' — que a triagem lia como ILEGIVEL, um estado terminal. Agora a espera tem prazo e,
+    esgotado, a resposta e 503 'servico ocupado', que o n8n trata como falha transitoria."""
+    restante = orcamento - (time.time() - t_inicio)
+    if restante <= 15 or not lock.acquire(timeout=max(1, restante - 15)):
+        raise ServicoOcupado(f"servico ocupado com outra NT ({nome}); orcamento de {orcamento}s esgotado na espera")
+
+
 ENATJUS_BASE = "https://www.pje.jus.br/e-natjus"
 LOGIN_URL     = f"{ENATJUS_BASE}/index.php"
 LISTA_URL     = f"{ENATJUS_BASE}/notaTecnica-solicitacao-listar.php"
@@ -594,7 +609,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-18"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-19"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -930,10 +945,48 @@ def processar():
         evento_meu.set()
 
 
-def _processar_nt(nt, t_inicio):
+def _extrair_paginas(conteudo, t_inicio, orcamento):
+    """(19/09/2026) Texto nativo pagina a pagina com PyMuPDF — dezenas de vezes mais rapido e
+    mais leve que o pdfplumber, que levava minutos num processo de 500 paginas e segurava a fila.
+    O pdfplumber fica como reserva quando o PyMuPDF nao esta disponivel ou falha no arquivo.
+    Respeita o orcamento: para de extrair quando o tempo acabar e devolve o que leu."""
+    textos = []
+    cortado = False
+    if fitz is not None:
+        doc = fitz.open(stream=conteudo, filetype="pdf")
+        try:
+            for i in range(doc.page_count):
+                if (time.time() - t_inicio) >= orcamento:
+                    cortado = True
+                    break
+                try:
+                    textos.append(doc.load_page(i).get_text("text") or "")
+                except Exception:
+                    textos.append("")
+        finally:
+            doc.close()
+        return textos, cortado
     import io
     import pdfplumber
-    with _lock_navegador:
+    with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
+        for pg in pdf.pages:
+            if (time.time() - t_inicio) >= orcamento:
+                cortado = True
+                break
+            textos.append(pg.extract_text() or "")
+            try:
+                pg.flush_cache()
+            except Exception:
+                pass
+    return textos, cortado
+
+
+def _processar_nt(nt, t_inicio):
+    try:
+        _adquirir(_lock_navegador, t_inicio, PROCESSAR_ORCAMENTO_S, "navegador")
+    except ServicoOcupado as e:
+        return jsonify({"erro": str(e), "numeroNT": nt}), 503
+    try:
         with sync_playwright() as p:
             browser = _launch_browser(p)
             context = browser.new_context(accept_downloads=True)
@@ -954,7 +1007,9 @@ def _processar_nt(nt, t_inicio):
                 except Exception:
                     pass
                 return jsonify({"erro": str(e), "numeroNT": nt}), 500
-    # baixa todos os arquivos; usa texto nativo (pdfplumber) onde der e faz OCR
+    finally:
+        _lock_navegador.release()
+    # baixa todos os arquivos; usa texto nativo (PyMuPDF) onde der e faz OCR
     # SELETIVO so nas paginas escaneadas, com orcamento de tempo e de paginas.
     # Processa do menor para o maior (laudo/relatorio costuma ser o arquivo menor).
     texto_total = ""
@@ -972,7 +1027,10 @@ def _processar_nt(nt, t_inicio):
     if anexos_total > 5:
         avisos.append(f"A NT tem {anexos_total} anexos; so os 5 primeiros foram lidos.")
     # Download + OCR serializados entre chamadas do /processar (ver _lock_ocr no topo).
-    _lock_ocr.acquire()
+    try:
+        _adquirir(_lock_ocr, t_inicio, PROCESSAR_ORCAMENTO_S, "download/OCR")
+    except ServicoOcupado as e:
+        return jsonify({"erro": str(e), "numeroNT": nt}), 503
     try:
       # 1) baixa o conteudo de cada arquivo
       baixados = []
@@ -996,14 +1054,14 @@ def _processar_nt(nt, t_inicio):
       while baixados:
         idx, conteudo = baixados.pop(0)
         try:
-            textos = []
-            with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
-                for pg in pdf.pages:
-                    textos.append(pg.extract_text() or "")
-                    try:
-                        pg.flush_cache()
-                    except Exception:
-                        pass
+            textos, cortado = _extrair_paginas(conteudo, t_inicio, OCR_TIME_BUDGET)
+            if not textos:
+                # nenhuma pagina lida (orcamento ja esgotado ou PDF vazio): nao conta como arquivo lido
+                avisos.append(f"Arquivo {idx+1} nao foi lido: orcamento de tempo esgotado antes da primeira pagina.")
+                texto_total += f"\n[arquivo {idx+1} nao lido: orcamento de tempo esgotado]\n"
+                continue
+            if cortado:
+                avisos.append(f"Arquivo {idx+1}: leitura interrompida na pagina {len(textos)} por orcamento de tempo.")
             doc_fitz = None
             for i, txt_pagina in enumerate(textos):
                 paginas_total += 1
@@ -1039,6 +1097,12 @@ def _processar_nt(nt, t_inicio):
     finally:
         _lock_ocr.release()
     texto_total = texto_total.strip()
+    if arquivos == 0 and anexos_total > 0:
+        # 19/09/2026: nenhum anexo lido (orcamento esgotado, download falhou ou arquivo acima do teto).
+        # Devolver 200 com 'ilegivel' fazia a triagem marcar a NT como ILEGIVEL para sempre; 503 faz
+        # o n8n tratar como transitorio (volta a 'novo'), e a triagem manual continua disponivel.
+        return jsonify({"erro": "nenhum anexo foi baixado: " + (" ".join(avisos) or texto_total[:300]), "numeroNT": nt,
+                        "anexos_total": anexos_total, "avisos": avisos}), 503
     # links diretos de download de cada arquivo no e-NatJus (sem trazer o PDF pro n8n)
     arquivos_links = [
         {
@@ -1656,9 +1720,6 @@ def comprimir():
         })
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
