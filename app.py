@@ -609,7 +609,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-19"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -1681,6 +1681,539 @@ def preencher():
             except Exception:
                 pass
             return jsonify({"erro": str(e), "log": log, "screenshot": sc}), 500
+
+# ─────────────────────────────────────────────
+# Rota [REVISAO] — preenche a NT inteira no e-NatJus a partir do rascunho revisado
+# ─────────────────────────────────────────────
+# (20/09/2026) Ate aqui o /preencher so sabia os campos de identificacao (CID, diagnostico,
+# meios confirmatorios, NatJus responsavel, instituicao, tutoria). Esta rota cobre TODO o
+# formulario da tecnologia — selects fechados, buscas select2 (principio ativo, nome comercial,
+# procedimento), textos, precos com mascara e os 8 campos ricos em CKEditor — a partir de um
+# dicionario {id_do_campo: valor} que a pagina de revisao monta depois do parecerista confirmar
+# campo a campo.
+#
+# O que ela NUNCA faz: clicar em 'Salvar e Finalizar Tecnologia'. Finalizar e o que libera a
+# emissao; enquanto so 'Salvar Tecnologia' e usado, o proprio e-NatJus segura a NT ate um humano
+# entrar la e finalizar/emitir. Com salvar=false (default) ela nem salva: preenche, le de volta
+# e devolve o que ficaria em cada campo, com captura de tela — e o modo de conferencia.
+#
+# Inventario dos campos: GET /campos/<nt> (a rota abaixo usa os ids de la).
+
+# id -> (tipo, rotulo humano). A ordem AQUI e a ordem de preenchimento: os selects que
+# mostram/escondem outros campos (tipo da tecnologia, registro ANVISA, SUS, generico/similar,
+# urgencia) vem antes dos campos que dependem deles.
+CAMPOS_NT = [
+    ("selTipoTecnologia", "select", "Tipo da Tecnologia"),
+    ("selRegistroAnvisa", "select", "Registro na ANVISA?"),
+    ("selSituacaoAnvisa", "select", "Situação do registro"),
+    ("txtDcb", "select2", "Princípio Ativo"),
+    ("txtDcbComercial", "select2", "Nome comercial"),
+    ("txtProcedimento", "select2", "Descrição (procedimento)"),
+    ("txtProduto", "texto", "Descrição (produto)"),
+    ("txtViaAdministracao", "texto", "Via de administração"),
+    ("txaPosologia", "texto", "Posologia"),
+    ("selUsoContinuo", "select", "Uso contínuo?"),
+    ("txtDuracaoTratamento", "inteiro", "Duração do tratamento"),
+    ("selUnidadeDuracaoTratamento", "select", "Duração do tratamento (unidade)"),
+    ("selIndicacaoConformidade", "select", "Indicação em conformidade com o registro?"),
+    ("selPrevistoProtocolo", "select", "Previsto em PCDT?"),
+    ("selDisponivelSus", "select", "Inserido no SUS?"),
+    ("selTabelaTecnologia", "select", "Incluído em (RENAME/REMUME/SIGTAP/CIB)"),
+    ("selOncologico", "select", "Oncológico?"),
+    ("txaOpcaoSus", "ckeditor", "Opções disponíveis no SUS e/ou Saúde Suplementar"),
+    ("selExisteGenerico", "select", "Existe Genérico?"),
+    ("selExisteBiossimilar", "select", "Existe Similar?"),
+    ("txaGenericoBiossimilar", "ckeditor", "Opções de Genérico ou Similar"),
+    ("txtLaboratorio", "texto", "Laboratório"),
+    ("txtMarcaComercial", "texto", "Marca Comercial"),
+    ("txtApresentacao", "texto", "Apresentação"),
+    ("txtPrecoFabrica", "dinheiro", "Preço de Fábrica"),
+    ("txtPrecoMaximoGoverno", "dinheiro", "PMVG (apresentação)"),
+    ("txtPrecoMaximoConsumidor", "dinheiro", "PMC (apresentação)"),
+    ("txtDoseDiariaRecomendada", "texto", "Dose Diária Recomendada"),
+    ("txtPrecoMaximoGovernoTratamentoMensal", "dinheiro", "PMVG (tratamento mensal)"),
+    ("txtPrecoMaximoConsumidorTratamentoMensal", "dinheiro", "PMC (tratamento mensal)"),
+    ("txtCustoTecnologia", "ckeditor", "Custo da tecnologia"),
+    ("txtFonteCusto", "texto", "Fonte do custo da tecnologia"),
+    ("txaEficaciaSeguranca", "ckeditor", "Evidências sobre a eficácia e segurança"),
+    ("txaImpactoTecnologia", "ckeditor", "Benefício/efeito/resultado esperado"),
+    ("selRecomendacaoConitec", "select", "Recomendações da CONITEC"),
+    ("selConclusao", "select", "Conclusão Justificada"),
+    ("txaConclusao", "ckeditor", "Conclusão"),
+    ("selEvidenciaCientifica", "select", "Há evidências científicas?"),
+    ("selAlegacaoUrgencia", "select", "Justifica-se a alegação de urgência?"),
+    ("selAlegacaoUrgenciaJustificativaNotaTecnica", "select", "Justificativa da urgência"),
+    ("txaReferencia", "ckeditor", "Referências bibliográficas"),
+    ("txaOutraInformacao", "ckeditor", "Outras Informações"),
+]
+CAMPOS_NT_POR_ID = {c[0]: (c[1], c[2]) for c in CAMPOS_NT}
+
+
+def _norm_txt(s):
+    """minusculas, sem acento, espacos colapsados — para comparar rotulos e opcoes."""
+    import unicodedata
+    s = unicodedata.normalize("NFD", str(s or ""))
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _html_de_texto(valor):
+    """Texto plano -> HTML de paragrafos (uma linha em branco separa paragrafos; quebra simples
+    vira <br>). Se ja vier com tags, passa como esta."""
+    v = str(valor or "")
+    if re.search(r"<\s*(p|br|ul|ol|li|table|b|strong|i|em|h\d)\b", v, re.IGNORECASE):
+        return v
+    def esc(t):
+        return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    blocos = [b.strip() for b in re.split(r"\n\s*\n", v.replace("\r\n", "\n")) if b.strip()]
+    return "".join("<p>" + esc(b).replace("\n", "<br>") + "</p>" for b in blocos)
+
+
+def _texto_de_html(h):
+    t = re.sub(r"<\s*br\s*/?>", "\n", str(h or ""), flags=re.IGNORECASE)
+    t = re.sub(r"</\s*(p|div|li|tr|h\d)\s*>", "\n", t, flags=re.IGNORECASE)
+    t = re.sub(r"<[^>]+>", "", t)
+    t = t.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    return re.sub(r"[ \t]+", " ", t).strip()
+
+
+def _centavos(valor):
+    """'1.234,56' | '1234.56' | 1234.56 -> 123456 (inteiro em centavos). None se nao parsear."""
+    if valor is None or valor == "":
+        return None
+    if isinstance(valor, (int, float)):
+        return int(round(float(valor) * 100))
+    s = re.sub(r"[^\d.,]", "", str(valor))
+    if not s:
+        return None
+    if "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        return int(round(float(s) * 100))
+    except Exception:
+        return None
+
+
+def _visivel(pagina, id_campo, tipo):
+    """O campo esta na tela? Selects/inputs: o proprio elemento. select2: o widget ao lado.
+    CKEditor: o container cke_<id>. Campos escondidos pelo tipo da tecnologia sao pulados."""
+    try:
+        if tipo == "select2":
+            return pagina.evaluate("""(id) => {
+                const el = document.getElementById(id); if (!el) return false;
+                const w = el.nextElementSibling && el.nextElementSibling.classList && el.nextElementSibling.classList.contains('select2') ? el.nextElementSibling : null;
+                const alvo = w || el;
+                return !!(alvo.offsetParent) ;
+            }""", id_campo)
+        if tipo == "ckeditor":
+            return pagina.evaluate("""(id) => {
+                const c = document.getElementById('cke_' + id);
+                if (c) return !!c.offsetParent;
+                const el = document.getElementById(id); return !!(el && el.offsetParent);
+            }""", id_campo)
+        return pagina.evaluate("(id) => { const el = document.getElementById(id); return !!(el && el.offsetParent); }", id_campo)
+    except Exception:
+        return False
+
+
+def _ler_select(pagina, id_campo):
+    return pagina.evaluate("""(id) => { const el = document.getElementById(id); if (!el) return null;
+        const op = el.options[el.selectedIndex]; return op ? op.text.trim() : ''; }""", id_campo)
+
+
+def _preencher_select_id(pagina, id_campo, valor, log, nome):
+    """<select> comum: casa a opcao por texto normalizado (sem acento/caixa) ou por value."""
+    alvo = _norm_txt(valor)
+    try:
+        opcoes = pagina.evaluate("""(id) => { const el = document.getElementById(id); if (!el) return null;
+            return Array.from(el.options).map(o => ({v: o.value, t: o.text.trim()})); }""", id_campo)
+        if opcoes is None:
+            log.append(f"{nome}: FALHOU (select #{id_campo} nao existe)")
+            return {"status": "FALHOU", "motivo": "campo nao existe"}
+        escolha = None
+        for o in opcoes:
+            if _norm_txt(o["t"]) == alvo or _norm_txt(o["v"]) == alvo:
+                escolha = o
+                break
+        if escolha is None:
+            # aceita prefixo inequivoco ("Nao" -> "Não"; "Recomendada" nao pode casar "Não Recomendada")
+            cands = [o for o in opcoes if _norm_txt(o["t"]).startswith(alvo) and alvo]
+            if len(cands) == 1:
+                escolha = cands[0]
+        if escolha is None:
+            disp = [o["t"] for o in opcoes if o["t"]]
+            log.append(f"{nome}: FALHOU (opcao '{valor}' nao existe; opcoes: {', '.join(disp)[:120]})")
+            return {"status": "FALHOU", "motivo": "opcao inexistente", "opcoes": disp}
+        pagina.select_option(f"#{id_campo}", value=escolha["v"], timeout=5000)
+        pagina.wait_for_timeout(250)
+        lido = _ler_select(pagina, id_campo)
+        ok = _norm_txt(lido) == _norm_txt(escolha["t"])
+        log.append(f"{nome}: {'OK' if ok else 'GRAVOU DIFERENTE'} ({lido})")
+        return {"status": "OK" if ok else "FALHOU", "lido": lido}
+    except Exception as e:
+        log.append(f"{nome}: FALHOU ({type(e).__name__}: {str(e)[:90]})")
+        return {"status": "FALHOU", "motivo": str(e)[:120]}
+
+
+def _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato=True):
+    """Combobox select2 com busca remota (principio ativo, nome comercial, procedimento).
+    Abre o widget, digita, lista TODAS as opcoes devolvidas e escolhe a que casa exatamente com o
+    valor (normalizado). Sem casamento exato: com exigir_exato=True devolve AMBIGUO/SEM_RESULTADO
+    e a lista de candidatos (a pagina de revisao mostra para o parecerista escolher); com
+    exigir_exato=False pega a primeira e marca 'aproximado'."""
+    alvo = str(valor or "").strip()
+    try:
+        gatilho = pagina.locator(f"#select2-{id_campo}-container").first
+        if gatilho.count() == 0:
+            gatilho = pagina.locator(f"#{id_campo} + span.select2 .select2-selection:visible").first
+        gatilho.wait_for(state="visible", timeout=8000)
+        gatilho.click()
+        pagina.wait_for_timeout(400)
+        busca = pagina.locator("input.select2-search__field:visible").last
+        try:
+            busca.fill(alvo, timeout=4000)
+        except Exception:
+            pagina.keyboard.type(alvo, delay=40)
+        # espera a busca remota devolver algo alem de 'Carregando'
+        fim = time.time() + 12
+        cands = []
+        while time.time() < fim:
+            pagina.wait_for_timeout(500)
+            cands = pagina.evaluate("""() => Array.from(document.querySelectorAll('.select2-results__option'))
+                .map(e => (e.innerText || '').trim()).filter(Boolean)""")
+            if cands and not any(re.search(r"carregando|searching|loading", c, re.IGNORECASE) for c in cands):
+                break
+        cands = [c for c in cands if c]
+        sem = [c for c in cands if re.search(r"nenhum resultado|no results", c, re.IGNORECASE)]
+        if not cands or sem:
+            pagina.keyboard.press("Escape")
+            log.append(f"{nome}: SEM_RESULTADO (busca por '{alvo[:40]}')")
+            return {"status": "SEM_RESULTADO", "candidatos": []}
+        exatos = [c for c in cands if _norm_txt(c) == _norm_txt(alvo)]
+        escolhida = None
+        aproximado = False
+        if exatos:
+            escolhida = exatos[0]
+        elif len(cands) == 1:
+            escolhida = cands[0]
+            aproximado = _norm_txt(cands[0]) != _norm_txt(alvo)
+        elif not exigir_exato:
+            escolhida = cands[0]
+            aproximado = True
+        if escolhida is None:
+            pagina.keyboard.press("Escape")
+            log.append(f"{nome}: AMBIGUO ({len(cands)} opcoes para '{alvo[:40]}')")
+            return {"status": "AMBIGUO", "candidatos": cands[:15]}
+        opcao = pagina.locator(".select2-results__option").filter(has_text=re.compile(r"^\s*" + re.escape(escolhida) + r"\s*$")).first
+        if opcao.count() == 0:
+            opcao = pagina.locator(".select2-results__option:visible").first
+        opcao.click()
+        pagina.wait_for_timeout(500)
+        lido = pagina.evaluate("""(id) => { const c = document.getElementById('select2-' + id + '-container');
+            return c ? (c.getAttribute('title') || c.innerText || '').trim() : ''; }""", id_campo)
+        ok = _norm_txt(lido) == _norm_txt(escolhida) or _norm_txt(escolhida) in _norm_txt(lido)
+        st = "OK" if ok else "FALHOU"
+        if ok and aproximado:
+            st = "APROXIMADO"
+        log.append(f"{nome}: {st} ({lido[:60]})")
+        return {"status": st, "lido": lido, "candidatos": cands[:15]}
+    except Exception as e:
+        try:
+            pagina.keyboard.press("Escape")
+        except Exception:
+            pass
+        log.append(f"{nome}: FALHOU ({type(e).__name__}: {str(e)[:90]})")
+        return {"status": "FALHOU", "motivo": str(e)[:120]}
+
+
+def _preencher_texto_id(pagina, id_campo, valor, log, nome, tipo):
+    """input de texto, textarea simples, inteiro ou dinheiro (input-money: digita so os digitos,
+    a mascara formata; confere pelos centavos)."""
+    try:
+        campo = pagina.locator(f"#{id_campo}").first
+        campo.wait_for(state="visible", timeout=8000)
+        if tipo == "dinheiro":
+            cents = _centavos(valor)
+            if cents is None:
+                log.append(f"{nome}: FALHOU (valor monetario invalido: {str(valor)[:30]})")
+                return {"status": "FALHOU", "motivo": "valor invalido"}
+            campo.click()
+            campo.fill("")
+            pagina.keyboard.type(str(cents), delay=15)
+            campo.dispatch_event("change")
+            campo.press("Tab")
+            pagina.wait_for_timeout(200)
+            lido = campo.input_value()
+            ok = _centavos(lido) == cents
+            if not ok:
+                # mascara ausente: tenta o texto formatado
+                fmt = f"{cents // 100:,}".replace(",", ".") + "," + f"{cents % 100:02d}"
+                campo.fill(fmt)
+                campo.dispatch_event("change")
+                pagina.wait_for_timeout(200)
+                lido = campo.input_value()
+                ok = _centavos(lido) == cents
+            log.append(f"{nome}: {'OK' if ok else 'GRAVOU DIFERENTE'} ({lido})")
+            return {"status": "OK" if ok else "FALHOU", "lido": lido}
+        if tipo == "inteiro":
+            v = re.sub(r"\D", "", str(valor))
+            if not v:
+                log.append(f"{nome}: FALHOU (inteiro vazio: {str(valor)[:30]})")
+                return {"status": "FALHOU", "motivo": "inteiro invalido"}
+            valor = v
+        campo.fill("")
+        campo.fill(str(valor))
+        campo.dispatch_event("change")
+        lido = campo.input_value()
+        ok = lido.strip() == str(valor).strip()
+        log.append(f"{nome}: {'OK' if ok else 'GRAVOU DIFERENTE'} ({lido[:50]})")
+        return {"status": "OK" if ok else "FALHOU", "lido": lido[:200]}
+    except Exception as e:
+        log.append(f"{nome}: FALHOU ({type(e).__name__}: {str(e)[:90]})")
+        return {"status": "FALHOU", "motivo": str(e)[:120]}
+
+
+def _preencher_ckeditor_id(pagina, id_campo, valor, log, nome):
+    """Campo rico: escreve pela API do CKEditor (setData) e sincroniza o <textarea>; le de volta
+    com getData. Sem instancia, cai para o textarea (o e-NatJus le o textarea no submit)."""
+    html = _html_de_texto(valor)
+    try:
+        r = pagina.evaluate("""([id, html]) => {
+            if (window.CKEDITOR && CKEDITOR.instances && CKEDITOR.instances[id]) {
+                const ed = CKEDITOR.instances[id];
+                ed.setData(html);
+                try { ed.updateElement(); } catch (e) {}
+                return { modo: 'ckeditor', lido: ed.getData() || '' };
+            }
+            const el = document.getElementById(id);
+            if (!el) return { modo: 'ausente', lido: '' };
+            el.value = html;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return { modo: 'textarea', lido: el.value };
+        }""", [id_campo, html])
+        if r["modo"] == "ausente":
+            log.append(f"{nome}: FALHOU (campo #{id_campo} nao existe)")
+            return {"status": "FALHOU", "motivo": "campo nao existe"}
+        # setData e assincrono em algumas versoes: espera ate o getData refletir
+        esperado = _texto_de_html(html)
+        lido = _texto_de_html(r["lido"])
+        fim = time.time() + 6
+        while esperado and _norm_txt(lido)[:200] != _norm_txt(esperado)[:200] and time.time() < fim:
+            pagina.wait_for_timeout(400)
+            lido = _texto_de_html(pagina.evaluate("""(id) => (window.CKEDITOR && CKEDITOR.instances && CKEDITOR.instances[id]) ? (CKEDITOR.instances[id].getData() || '') : ((document.getElementById(id) || {}).value || '')""", id_campo))
+        ok = (not esperado) or _norm_txt(lido)[:200] == _norm_txt(esperado)[:200]
+        log.append(f"{nome}: {'OK' if ok else 'GRAVOU DIFERENTE'} ({r['modo']}, {len(lido)} caracteres)")
+        return {"status": "OK" if ok else "FALHOU", "modo": r["modo"], "caracteres": len(lido), "lido": lido[:300]}
+    except Exception as e:
+        log.append(f"{nome}: FALHOU ({type(e).__name__}: {str(e)[:90]})")
+        return {"status": "FALHOU", "motivo": str(e)[:120]}
+
+
+def _ler_campos_nt(pagina):
+    """Le o estado atual de todos os campos de CAMPOS_NT (para a conferencia e para o
+    'depois de salvar'). Ricos: texto plano truncado + tamanho."""
+    return pagina.evaluate("""(lista) => {
+      const out = {};
+      const norm = h => String(h || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\\s+/g, ' ').trim();
+      for (const [id, tipo] of lista) {
+        const el = document.getElementById(id);
+        if (!el) { out[id] = { existe: false }; continue; }
+        const vis = !!(el.offsetParent) || (tipo === 'select2' && el.nextElementSibling && !!el.nextElementSibling.offsetParent) || (tipo === 'ckeditor' && document.getElementById('cke_' + id) && !!document.getElementById('cke_' + id).offsetParent);
+        let valor = '';
+        if (tipo === 'select') { const op = el.options[el.selectedIndex]; valor = op ? op.text.trim() : ''; }
+        else if (tipo === 'select2') { const c = document.getElementById('select2-' + id + '-container'); valor = c ? (c.getAttribute('title') || c.innerText || '').trim() : ''; if (/^(selecione|digite)/i.test(valor)) valor = ''; }
+        else if (tipo === 'ckeditor') { let h = ''; try { h = (window.CKEDITOR && CKEDITOR.instances[id]) ? CKEDITOR.instances[id].getData() : el.value; } catch (e) { h = el.value; } const t = norm(h); out[id] = { existe: true, visivel: vis, valor: t.slice(0, 300), caracteres: t.length }; continue; }
+        else { valor = el.value || ''; }
+        out[id] = { existe: true, visivel: vis, valor: String(valor).slice(0, 300) };
+      }
+      return out;
+    }""", [[c[0], c[1]] for c in CAMPOS_NT])
+
+
+@app.route("/preencher-nt", methods=["POST"])
+@_serializado
+def preencher_nt():
+    """
+    Preenche o formulario da tecnologia da NT com os valores revisados e, se salvar=true, clica
+    em 'Salvar Tecnologia' (e SOMENTE nele).
+
+    Corpo:
+      numeroNT        obrigatorio
+      campos          {id: valor} — ids de CAMPOS_NT (ver GET /campos/<nt>). Valor de select =
+                      texto da opcao ('Não favorável'); select2 = termo a buscar; dinheiro =
+                      '1.234,56' ou 1234.56; ricos = HTML ou texto plano (linhas viram <p>).
+      salvar          default false: preenche, confere e devolve sem gravar
+      exigir_exato    default true: buscas select2 so aceitam casamento exato (senao AMBIGUO)
+      ler_antes       default true: devolve o estado dos campos antes de mexer
+      captura         default true: screenshots (antes de salvar / final)
+
+    Resposta:
+      { sucesso, numeroNT, salvo, resultado: {id: {status, lido, candidatos?}}, falhas: [ids],
+        pulados: [ids ocultos], antes: {...}, depois: {...}, log: [...], screenshot, screenshot_antes_de_salvar }
+      status por campo: OK | APROXIMADO | AMBIGUO | SEM_RESULTADO | OCULTO | FALHOU
+    """
+    dados = request.json or {}
+    nt = str(dados.get("numeroNT") or "").strip()
+    if not nt:
+        return jsonify({"erro": "numeroNT obrigatorio"}), 400
+    campos = dados.get("campos") or {}
+    if not isinstance(campos, dict) or not campos:
+        return jsonify({"erro": "campos {id: valor} obrigatorio"}), 400
+    desconhecidos = [k for k in campos if k not in CAMPOS_NT_POR_ID]
+    salvar = bool(dados.get("salvar", False))
+    exigir_exato = bool(dados.get("exigir_exato", True))
+    ler_antes = bool(dados.get("ler_antes", True))
+    captura = bool(dados.get("captura", True))
+    log = []
+    if desconhecidos:
+        log.append("ids ignorados (fora de CAMPOS_NT): " + ", ".join(desconhecidos)[:200])
+
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = browser.new_context()
+        page = context.new_page()
+        try:
+            _exigir_sessao(context, page)
+            form = _navegar_ate_formulario(context, page, nt)
+            log.append("Formulario da NT localizado")
+            antes = _ler_campos_nt(form) if ler_antes else None
+
+            resultado = {}
+            pulados = []
+            for id_campo, tipo, nome in CAMPOS_NT:
+                if id_campo not in campos:
+                    continue
+                valor = campos[id_campo]
+                if valor is None or (isinstance(valor, str) and not valor.strip()):
+                    resultado[id_campo] = {"status": "VAZIO"}
+                    continue
+                if not _visivel(form, id_campo, tipo):
+                    pulados.append(id_campo)
+                    resultado[id_campo] = {"status": "OCULTO"}
+                    log.append(f"{nome}: OCULTO (nao se aplica a este tipo/resposta) — pulado")
+                    continue
+                if tipo == "select":
+                    r = _preencher_select_id(form, id_campo, valor, log, nome)
+                    form.wait_for_timeout(300)   # deixa o JS do e-NatJus mostrar/esconder dependentes
+                elif tipo == "select2":
+                    r = _preencher_select2_id(form, id_campo, valor, log, nome, exigir_exato)
+                elif tipo == "ckeditor":
+                    r = _preencher_ckeditor_id(form, id_campo, valor, log, nome)
+                else:
+                    r = _preencher_texto_id(form, id_campo, valor, log, nome, tipo)
+                resultado[id_campo] = r
+
+            falhas = [k for k, v in resultado.items() if v.get("status") in ("FALHOU", "AMBIGUO", "SEM_RESULTADO")]
+            depois_preencher = _ler_campos_nt(form)
+            shot_antes = _screenshot_b64(form) if captura else None
+
+            salvo = False
+            depois_salvar = None
+            if salvar:
+                if falhas:
+                    log.append(f"NAO salvo: {len(falhas)} campo(s) com falha — corrija e chame de novo")
+                else:
+                    try:
+                        botao = form.locator("button, a, input[type='submit'], input[type='button']").filter(
+                            has_text=re.compile(r"^\s*Salvar\s+Tecnologia\s*$", re.IGNORECASE)).first
+                        if botao.count() == 0:
+                            botao = form.locator("input[value='Salvar Tecnologia']").first
+                        botao.wait_for(state="visible", timeout=8000)
+                        botao.click()
+                        try:
+                            form.wait_for_load_state("networkidle", timeout=30000)
+                        except Exception:
+                            pass
+                        form.wait_for_timeout(1500)
+                        salvo = True
+                        log.append("Tecnologia salva (botao 'Salvar Tecnologia'); NAO finalizada — a emissao continua com o humano")
+                        try:
+                            form.wait_for_selector("text=Diagnóstico Principal", timeout=15000)
+                            depois_salvar = _ler_campos_nt(form)
+                        except Exception:
+                            depois_salvar = None
+                    except Exception as e:
+                        log.append(f"Salvar tecnologia: FALHOU ({type(e).__name__}: {str(e)[:90]})")
+            else:
+                log.append("NAO salvo — chamada de conferencia (salvar=false)")
+
+            shot_fim = _screenshot_b64(form) if (captura and salvar) else shot_antes
+            browser.close()
+            return jsonify({
+                "sucesso": len(falhas) == 0 and (salvo or not salvar),
+                "numeroNT": nt,
+                "salvo": salvo,
+                "resultado": resultado,
+                "falhas": falhas,
+                "pulados": pulados,
+                "antes": antes,
+                "depois": depois_salvar if depois_salvar is not None else depois_preencher,
+                "log": log,
+                "screenshot": shot_fim,
+                "screenshot_antes_de_salvar": shot_antes if salvar else None
+            })
+        except Exception as e:
+            sc = _screenshot_b64(page) if captura else None
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return jsonify({"erro": str(e), "numeroNT": nt, "log": log, "screenshot": sc}), 500
+
+
+@app.route("/opcoes-nt", methods=["POST"])
+@_serializado
+def opcoes_nt():
+    """
+    Lista as opcoes que a busca do e-NatJus devolve para um campo select2 (principio ativo, nome
+    comercial ou procedimento), SEM escolher nada. A pagina de revisao usa isto para o parecerista
+    apontar o registro certo quando a busca e ambigua.
+
+    Corpo: { numeroNT, campo: 'txtDcb'|'txtDcbComercial'|'txtProcedimento', termo }
+    Resposta: { numeroNT, campo, termo, candidatos: [...] }
+    """
+    dados = request.json or {}
+    nt = str(dados.get("numeroNT") or "").strip()
+    campo = str(dados.get("campo") or "").strip()
+    termo = str(dados.get("termo") or "").strip()
+    if not nt or not termo or CAMPOS_NT_POR_ID.get(campo, ("",))[0] != "select2":
+        return jsonify({"erro": "numeroNT, termo e campo select2 (txtDcb|txtDcbComercial|txtProcedimento) obrigatorios"}), 400
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = browser.new_context()
+        page = context.new_page()
+        try:
+            _exigir_sessao(context, page)
+            form = _navegar_ate_formulario(context, page, nt)
+            if not _visivel(form, campo, "select2"):
+                browser.close()
+                return jsonify({"numeroNT": nt, "campo": campo, "termo": termo, "candidatos": [], "aviso": "campo oculto para o tipo de tecnologia atual"})
+            gatilho = form.locator(f"#select2-{campo}-container").first
+            gatilho.wait_for(state="visible", timeout=8000)
+            gatilho.click()
+            form.wait_for_timeout(400)
+            busca = form.locator("input.select2-search__field:visible").last
+            busca.fill(termo, timeout=4000)
+            fim = time.time() + 12
+            cands = []
+            while time.time() < fim:
+                form.wait_for_timeout(500)
+                cands = form.evaluate("""() => Array.from(document.querySelectorAll('.select2-results__option'))
+                    .map(e => (e.innerText || '').trim()).filter(Boolean)""")
+                if cands and not any(re.search(r"carregando|searching|loading", c, re.IGNORECASE) for c in cands):
+                    break
+            form.keyboard.press("Escape")
+            cands = [c for c in cands if c and not re.search(r"nenhum resultado|no results", c, re.IGNORECASE)]
+            browser.close()
+            return jsonify({"numeroNT": nt, "campo": campo, "termo": termo, "candidatos": cands[:30]})
+        except Exception as e:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return jsonify({"erro": str(e), "numeroNT": nt, "campo": campo, "termo": termo}), 500
+
 
 # ─────────────────────────────────────────────
 # Rota [LEGADO] — extrai texto de um PDF em base64
