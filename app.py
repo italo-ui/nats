@@ -609,7 +609,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20b"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20d"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -2128,6 +2128,7 @@ def preencher_nt():
 
             salvo = False
             depois_salvar = None
+            verificacao = ""
             if salvar:
                 if falhas:
                     log.append(f"NAO salvo: {len(falhas)} campo(s) com falha — corrija e chame de novo")
@@ -2138,19 +2139,75 @@ def preencher_nt():
                         if botao.count() == 0:
                             botao = form.locator("input[value='Salvar Tecnologia']").first
                         botao.wait_for(state="visible", timeout=8000)
+                        # dialogos JS (alert de validacao) nao podem travar o robo: aceita e registra o texto
+                        dialogos = []
+                        def _on_dialog(d):
+                            try:
+                                dialogos.append(d.message)
+                            except Exception:
+                                pass
+                            try:
+                                d.accept()
+                            except Exception:
+                                pass
+                        form.on("dialog", _on_dialog)
                         botao.click()
                         try:
                             form.wait_for_load_state("networkidle", timeout=30000)
                         except Exception:
                             pass
                         form.wait_for_timeout(1500)
-                        salvo = True
-                        log.append("Tecnologia salva (botao 'Salvar Tecnologia'); NAO finalizada — a emissao continua com o humano")
+                        # validacao do proprio e-NatJus (campo obrigatorio vazio etc.): procura a mensagem na tela
+                        erro_val = ""
                         try:
-                            form.wait_for_selector("text=Diagnóstico Principal", timeout=15000)
-                            depois_salvar = _ler_campos_nt(form)
+                            erro_val = form.evaluate("""() => {
+                                const sel = '.alert-danger, .alert.alert-error, .has-error .help-block, .text-danger, .error, .invalid-feedback, .toast-error, .swal2-html-container';
+                                const vis = Array.from(document.querySelectorAll(sel)).filter(e => e.offsetParent && (e.innerText || '').trim());
+                                return vis.map(e => e.innerText.trim()).join(' | ').slice(0, 300);
+                            }""") or ""
                         except Exception:
+                            erro_val = ""
+                        if dialogos:
+                            erro_val = (erro_val + " | " if erro_val else "") + "dialogo: " + " / ".join(d[:120] for d in dialogos)
+                        # confirma pelo que ficou gravado: reabre a NT e le os campos enviados
+                        verificacao = ""
+                        try:
+                            form2 = _navegar_ate_formulario(context, page, nt)
+                            depois_salvar = _ler_campos_nt(form2)
+                            iguais, difs = 0, []
+                            for k, v in campos.items():
+                                tipo_k = CAMPOS_NT_POR_ID.get(k, ("",))[0]
+                                r_k = resultado.get(k) or {}
+                                if r_k.get("status") not in ("OK", "APROXIMADO"):
+                                    continue
+                                lido = str((depois_salvar.get(k) or {}).get("valor") or "")
+                                if tipo_k == "ckeditor":
+                                    ok_k = _norm_txt(lido)[:120] == _norm_txt(_texto_de_html(_html_de_texto(v)))[:120]
+                                elif tipo_k == "dinheiro":
+                                    ok_k = _centavos(lido) == _centavos(v)
+                                elif tipo_k == "select2":
+                                    ok_k = bool(lido) and (_norm_txt(str(r_k.get("lido") or v)) in _norm_txt(lido) or _norm_txt(lido) in _norm_txt(str(r_k.get("lido") or v)))
+                                else:
+                                    ok_k = _norm_txt(lido) == _norm_txt(str(v))
+                                if ok_k:
+                                    iguais += 1
+                                else:
+                                    difs.append(k)
+                            total_v = iguais + len(difs)
+                            verificacao = f"{iguais} de {total_v} campos conferidos apos reabrir a NT" + (" (divergentes: " + ", ".join(difs[:8]) + ")" if difs else "")
+                            salvo = total_v == 0 or iguais > 0
+                            if difs and iguais == 0:
+                                salvo = False
+                        except Exception as e_v:
                             depois_salvar = None
+                            verificacao = f"nao foi possivel reabrir a NT para conferir ({type(e_v).__name__})"
+                            salvo = not erro_val
+                        if erro_val:
+                            log.append(f"e-NatJus apontou validacao ao salvar: {erro_val[:200]}")
+                        if salvo:
+                            log.append("Tecnologia salva (botao 'Salvar Tecnologia'); NAO finalizada — a emissao continua com o humano. " + verificacao)
+                        else:
+                            log.append("Salvar tecnologia: NAO confirmado — " + (erro_val or verificacao))
                     except Exception as e:
                         log.append(f"Salvar tecnologia: FALHOU ({type(e).__name__}: {str(e)[:90]})")
             else:
@@ -2162,6 +2219,7 @@ def preencher_nt():
                 "sucesso": len(falhas) == 0 and (salvo or not salvar),
                 "numeroNT": nt,
                 "salvo": salvo,
+                "verificacao": verificacao if salvar else "",
                 "resultado": resultado,
                 "falhas": falhas,
                 "pulados": pulados,
@@ -2204,9 +2262,16 @@ def opcoes_nt():
         try:
             _exigir_sessao(context, page)
             form = _navegar_ate_formulario(context, page, nt)
+            # O e-NatJus so mostra principio ativo/nome comercial com Tipo = Medicamento e a descricao
+            # do procedimento com Tipo = Procedimento. Marca o tipo antes de buscar (nada e salvo:
+            # o navegador fecha sem 'Salvar Tecnologia'). O corpo pode mandar 'tipo' para forcar.
+            tipo = str(dados.get("tipo") or ("Procedimento" if campo == "txtProcedimento" else "Medicamento"))
+            if not _visivel(form, campo, "select2"):
+                _preencher_select_id(form, "selTipoTecnologia", tipo, [], "Tipo da Tecnologia")
+                form.wait_for_timeout(600)
             if not _visivel(form, campo, "select2"):
                 browser.close()
-                return jsonify({"numeroNT": nt, "campo": campo, "termo": termo, "candidatos": [], "aviso": "campo oculto para o tipo de tecnologia atual"})
+                return jsonify({"numeroNT": nt, "campo": campo, "termo": termo, "candidatos": [], "aviso": "campo oculto mesmo com tipo " + tipo})
             gatilho = form.locator(f"#select2-{campo}-container").first
             gatilho.wait_for(state="visible", timeout=8000)
             gatilho.click()
