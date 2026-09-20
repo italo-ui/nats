@@ -1,4 +1,5 @@
 import os, time, base64, json, subprocess, urllib.request, urllib.error, re
+import html
 import io
 import hmac, functools
 try:
@@ -609,7 +610,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20f"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20g"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -2055,7 +2056,9 @@ def _ler_campos_nt(pagina):
     'depois de salvar'). Ricos: texto plano truncado + tamanho."""
     return pagina.evaluate("""(lista) => {
       const out = {};
-      const norm = h => String(h || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\\s+/g, ' ').trim();
+      // (20/09/2026 g) decodifica as entidades HTML (&Aacute; etc.) que o e-NatJus devolve ao reabrir a NT:
+      // sem isso a conferencia pos-salvar acusava os textos ricos como divergentes (NT 568896).
+      const norm = h => { const ta = document.createElement('textarea'); ta.innerHTML = String(h || '').replace(/<[^>]+>/g, ' '); return String(ta.value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim(); };
       for (const [id, tipo] of lista) {
         const el = document.getElementById(id);
         if (!el) { out[id] = { existe: false }; continue; }
@@ -2206,7 +2209,7 @@ def preencher_nt():
                                 r_k = resultado.get(k) or {}
                                 if r_k.get("status") not in ("OK", "APROXIMADO"):
                                     continue
-                                lido = str((depois_salvar.get(k) or {}).get("valor") or "")
+                                lido = html.unescape(str((depois_salvar.get(k) or {}).get("valor") or ""))
                                 if tipo_k == "ckeditor":
                                     ok_k = _norm_txt(lido)[:120] == _norm_txt(_texto_de_html(_html_de_texto(v)))[:120]
                                 elif tipo_k == "dinheiro":
