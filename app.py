@@ -609,7 +609,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20d"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20f"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -1545,7 +1545,12 @@ def campos(nt):
 
     Existe para nao precisar adivinhar. Quando um campo falhar, esta rota diz exatamente com o
     que ele se parece no DOM, em vez de custar mais um ciclo de deploy para descobrir.
+
+    (20/09/2026 f) ?tipo=Medicamento|Procedimento|Produto: marca o Tipo da Tecnologia antes de
+    listar, para ver quais campos o e-NatJus mostra em cada caminho. Nada e salvo (o navegador
+    fecha sem 'Salvar Tecnologia'). Cada campo traz tambem maxlength e o texto da opcao marcada.
     """
+    tipo_forcado = str(request.args.get("tipo") or "").strip()
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context()
@@ -1553,6 +1558,9 @@ def campos(nt):
         try:
             _exigir_sessao(context, page)
             form = _navegar_ate_formulario(context, page, nt)
+            if tipo_forcado:
+                _preencher_select_id(form, "selTipoTecnologia", tipo_forcado, [], "Tipo da Tecnologia")
+                form.wait_for_timeout(800)
             dados = form.evaluate("""() => {
                 const out = [];
                 document.querySelectorAll('.form-group').forEach(g => {
@@ -1566,7 +1574,10 @@ def campos(nt):
                             name: c.name || '',
                             id: c.id || '',
                             classe: c.className || '',
-                            visivel: est.display !== 'none' && est.visibility !== 'hidden',
+                            maxlength: parseInt(c.getAttribute('maxlength') || '0', 10) || 0,
+                            visivel: (est.display !== 'none' && est.visibility !== 'hidden') && !!(c.offsetParent || (c.nextElementSibling && c.nextElementSibling.offsetParent)),
+                            obrigatorio: !!(lab && /\*/.test(lab.innerText || '')) || c.required === true,
+                            valor: (c.tagName.toLowerCase() === 'select') ? ((c.options[c.selectedIndex] || {}).text || '').trim() : String(c.value || '').slice(0, 120),
                             vizinhos: Array.from(g.querySelectorAll('div,span'))
                                 .map(e => e.className).filter(Boolean).slice(0, 6)
                         };
@@ -1580,7 +1591,7 @@ def campos(nt):
                 return out;
             }""")
             browser.close()
-            return jsonify({"numeroNT": nt, "total": len(dados), "campos": dados})
+            return jsonify({"numeroNT": nt, "tipo": tipo_forcado, "total": len(dados), "campos": dados})
         except Exception as e:
             sc = _screenshot_b64(page)
             try:
@@ -1926,7 +1937,11 @@ def _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato=True,
         pagina.wait_for_timeout(500)
         lido = pagina.evaluate("""(id) => { const c = document.getElementById('select2-' + id + '-container');
             return c ? (c.getAttribute('title') || c.innerText || '').trim() : ''; }""", id_campo)
-        ok = _norm_txt(lido) == _norm_txt(escolhida) or _norm_txt(escolhida) in _norm_txt(lido)
+        # (20/09/2026 e) Depois de escolher 'JAKAVI | FOSFATO DE RUXOLITINIBE', o container do select2
+        # mostra so 'JAKAVI' (primeiro segmento). Comparar com o texto inteiro dava FALHOU num campo
+        # que tinha sido gravado certo (NT 577999). Vale: igual, contido, ou igual ao primeiro segmento.
+        lido_n, esc_n = _norm_txt(lido), _norm_txt(escolhida)
+        ok = bool(lido_n) and (lido_n == esc_n or esc_n in lido_n or lido_n == seg1(escolhida) or (len(lido_n) >= 3 and lido_n in esc_n))
         st = "OK" if ok else "FALHOU"
         if ok and aproximado:
             st = "APROXIMADO"
@@ -1976,6 +1991,16 @@ def _preencher_texto_id(pagina, id_campo, valor, log, nome, tipo):
                 log.append(f"{nome}: FALHOU (inteiro vazio: {str(valor)[:30]})")
                 return {"status": "FALHOU", "motivo": "inteiro invalido"}
             valor = v
+        # (20/09/2026 e) O e-NatJus limita alguns inputs por maxlength (Dose Diaria Recomendada: 20).
+        # O navegador cortava em silencio e o campo saia 'GRAVOU DIFERENTE'. Agora devolve LONGO com
+        # o limite, sem digitar, para o parecerista encurtar o texto.
+        try:
+            mx = int(campo.get_attribute("maxlength") or 0)
+        except Exception:
+            mx = 0
+        if mx > 0 and len(str(valor)) > mx:
+            log.append(f"{nome}: LONGO ({len(str(valor))} caracteres; o e-NatJus aceita {mx})")
+            return {"status": "LONGO", "max": mx, "caracteres": len(str(valor)), "motivo": f"excede o limite de {mx} caracteres"}
         campo.fill("")
         campo.fill(str(valor))
         campo.dispatch_event("change")
@@ -2041,6 +2066,7 @@ def _ler_campos_nt(pagina):
         else if (tipo === 'ckeditor') { let h = ''; try { h = (window.CKEDITOR && CKEDITOR.instances[id]) ? CKEDITOR.instances[id].getData() : el.value; } catch (e) { h = el.value; } const t = norm(h); out[id] = { existe: true, visivel: vis, valor: t.slice(0, 300), caracteres: t.length }; continue; }
         else { valor = el.value || ''; }
         out[id] = { existe: true, visivel: vis, valor: String(valor).slice(0, 300) };
+        const mx = parseInt(el.getAttribute('maxlength') || '0', 10); if (mx > 0) out[id].max = mx;
       }
       return out;
     }""", [[c[0], c[1]] for c in CAMPOS_NT])
@@ -2066,7 +2092,7 @@ def preencher_nt():
     Resposta:
       { sucesso, numeroNT, salvo, resultado: {id: {status, lido, candidatos?}}, falhas: [ids],
         pulados: [ids ocultos], antes: {...}, depois: {...}, log: [...], screenshot, screenshot_antes_de_salvar }
-      status por campo: OK | APROXIMADO | AMBIGUO | SEM_RESULTADO | OCULTO | FALHOU
+      status por campo: OK | APROXIMADO | AMBIGUO | SEM_RESULTADO | OCULTO | VAZIO | LONGO (excede maxlength) | FALHOU
     """
     dados = request.json or {}
     nt = str(dados.get("numeroNT") or "").strip()
@@ -2122,7 +2148,7 @@ def preencher_nt():
                     r = _preencher_texto_id(form, id_campo, valor, log, nome, tipo)
                 resultado[id_campo] = r
 
-            falhas = [k for k, v in resultado.items() if v.get("status") in ("FALHOU", "AMBIGUO", "SEM_RESULTADO")]
+            falhas = [k for k, v in resultado.items() if v.get("status") in ("FALHOU", "AMBIGUO", "SEM_RESULTADO", "LONGO")]
             depois_preencher = _ler_campos_nt(form)
             shot_antes = _screenshot_b64(form) if captura else None
 
