@@ -610,7 +610,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20g"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20h"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -1591,8 +1591,23 @@ def campos(nt):
                 });
                 return out;
             }""")
+            # (20/09/2026 h) botoes e links visiveis da pagina (texto, tag, href, onclick): para mapear
+            # '+ Adicionar Tecnologia' e 'Salvar e Finalizar' sem clicar em nada.
+            botoes = []
+            try:
+                botoes = form.evaluate("""() => Array.from(document.querySelectorAll('a, button, input[type=submit], input[type=button]'))
+                    .filter(e => e.offsetParent)
+                    .map(e => ({ tag: e.tagName.toLowerCase(), texto: (e.innerText || e.value || '').trim().slice(0, 80), href: (e.getAttribute('href') || '').slice(0, 200), onclick: (e.getAttribute('onclick') || '').slice(0, 200), id: e.id || '', classe: (e.className || '').toString().slice(0, 80) }))
+                    .filter(b => b.texto)""") or []
+            except Exception:
+                botoes = []
+            abas = []
+            try:
+                abas = form.evaluate("""() => Array.from(document.querySelectorAll('.nav-tabs li, ul.nav li, .tab-pane')).map(e => ({ tag: e.tagName.toLowerCase(), id: e.id || '', classe: (e.className || '').toString().slice(0, 60), texto: (e.innerText || '').trim().slice(0, 60) })).slice(0, 40)""") or []
+            except Exception:
+                abas = []
             browser.close()
-            return jsonify({"numeroNT": nt, "tipo": tipo_forcado, "total": len(dados), "campos": dados})
+            return jsonify({"numeroNT": nt, "tipo": tipo_forcado, "total": len(dados), "campos": dados, "botoes": botoes, "abas": abas})
         except Exception as e:
             sc = _screenshot_b64(page)
             try:
@@ -2325,6 +2340,102 @@ def opcoes_nt():
             except Exception:
                 pass
             return jsonify({"erro": str(e), "numeroNT": nt, "campo": campo, "termo": termo}), 500
+
+
+@app.route("/finalizar-nt", methods=["POST"])
+@_serializado
+def finalizar_nt():
+    """
+    (20/09/2026 h) Clica em 'Salvar e Finalizar Tecnologia' na NT — e SOMENTE nele. E o passo que o
+    parecerista dispara, de proposito, pelo botao proprio da pagina de revisao, depois de a tecnologia
+    estar salva e revisada. Finalizar libera, na propria NT, o botao de emissao — que continua sendo
+    um clique HUMANO dentro do e-NatJus: esta rota NUNCA clica em 'Realizar emissao'/'Emitir'.
+
+    Corpo: { numeroNT, captura=true }
+    Resposta: { numeroNT, finalizada, emissao_disponivel, botao_clicado, dialogos, validacao, botoes_depois, log, screenshot }
+    """
+    dados = request.json or {}
+    nt = str(dados.get("numeroNT") or "").strip()
+    captura = bool(dados.get("captura", True))
+    if not nt:
+        return jsonify({"erro": "numeroNT obrigatorio"}), 400
+    log = []
+    with sync_playwright() as p:
+        browser = _launch_browser(p)
+        context = browser.new_context()
+        page = context.new_page()
+        try:
+            _exigir_sessao(context, page)
+            form = _navegar_ate_formulario(context, page, nt)
+            log.append("Formulario da NT localizado")
+            re_fin = re.compile(r"^\s*Salvar\s+e\s+Finalizar(\s+Tecnologia)?\s*$", re.IGNORECASE)
+            botao = form.locator("button, a, input[type='submit'], input[type='button']").filter(has_text=re_fin).first
+            if botao.count() == 0:
+                botao = form.locator("input[value*='Finalizar']").first
+            if botao.count() == 0:
+                vis = form.evaluate("""() => Array.from(document.querySelectorAll('a, button, input[type=submit], input[type=button]')).filter(e => e.offsetParent).map(e => (e.innerText || e.value || '').trim()).filter(Boolean).slice(0, 40)""") or []
+                browser.close()
+                return jsonify({"numeroNT": nt, "finalizada": False, "erro": "botao 'Salvar e Finalizar' nao encontrado", "botoes_visiveis": vis, "log": log})
+            botao.wait_for(state="visible", timeout=8000)
+            dialogos = []
+            def _on_dialog(d):
+                try:
+                    dialogos.append(d.message)
+                except Exception:
+                    pass
+                try:
+                    d.accept()
+                except Exception:
+                    pass
+            form.on("dialog", _on_dialog)
+            botao.click()
+            log.append("Clicado: 'Salvar e Finalizar Tecnologia'")
+            try:
+                form.wait_for_load_state("networkidle", timeout=30000)
+            except Exception:
+                pass
+            form.wait_for_timeout(2000)
+            validacao = ""
+            try:
+                validacao = form.evaluate("""() => {
+                    const sel = '.alert-danger, .alert.alert-error, .has-error .help-block, .text-danger, .error, .invalid-feedback, .toast-error, .swal2-html-container';
+                    const vis = Array.from(document.querySelectorAll(sel)).filter(e => e.offsetParent && (e.innerText || '').trim());
+                    return vis.map(e => e.innerText.trim()).join(' | ').slice(0, 400);
+                }""") or ""
+            except Exception:
+                validacao = ""
+            # reabre a pagina da NT e le o que ficou: botao de emissao visivel? 'Salvar Tecnologia' sumiu?
+            emissao = False
+            botoes_depois = []
+            try:
+                pagina2 = _navegar_ate_pagina_nt(context, page, nt)
+                pagina2.wait_for_timeout(1500)
+                botoes_depois = pagina2.evaluate("""() => Array.from(document.querySelectorAll('a, button, input[type=submit], input[type=button]')).filter(e => e.offsetParent).map(e => (e.innerText || e.value || '').trim()).filter(Boolean).slice(0, 60)""") or []
+                emissao = any(re.search(r"emiss[aã]o|emitir", b, re.IGNORECASE) for b in botoes_depois)
+                texto_pag = ""
+                try:
+                    texto_pag = pagina2.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
+                except Exception:
+                    texto_pag = ""
+                finalizada = emissao or bool(re.search(r"finalizad", texto_pag, re.IGNORECASE))
+            except Exception as e_r:
+                finalizada = not validacao and not any(re.search(r"obrigat|inv[aá]lid|erro", d, re.IGNORECASE) for d in dialogos)
+                log.append(f"nao foi possivel reabrir a NT para conferir ({type(e_r).__name__})")
+            if dialogos:
+                log.append("dialogo(s): " + " / ".join(d[:120] for d in dialogos))
+            if validacao:
+                log.append("e-NatJus apontou validacao: " + validacao[:200])
+            log.append(("Tecnologia FINALIZADA" if finalizada else "Finalizacao NAO confirmada") + (" — botao de emissao visivel na NT (emitir continua sendo o seu clique)" if emissao else ""))
+            sc = _screenshot_b64(page) if captura else None
+            browser.close()
+            return jsonify({"numeroNT": nt, "finalizada": bool(finalizada), "emissao_disponivel": bool(emissao), "botao_clicado": "Salvar e Finalizar Tecnologia", "dialogos": dialogos, "validacao": validacao, "botoes_depois": botoes_depois, "log": log, "screenshot": sc})
+        except Exception as e:
+            sc = _screenshot_b64(page) if captura else None
+            try:
+                browser.close()
+            except Exception:
+                pass
+            return jsonify({"erro": str(e), "numeroNT": nt, "finalizada": False, "log": log, "screenshot": sc}), 500
 
 
 # ─────────────────────────────────────────────
