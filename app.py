@@ -610,7 +610,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20j"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20k"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -1999,6 +1999,40 @@ def _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato=True,
         return {"status": "FALHOU", "motivo": str(e)[:120]}
 
 
+def _termos_alternativos(valor):
+    """(20/09/2026 k) Termos mais curtos para repetir a busca do select2 quando o termo inteiro nao
+    devolve nada. Caso real: 'SCEMBLIX (Novartis Biociencias S.A.).' nao acha, 'SCEMBLIX' acha (NT 572428).
+    Ordem: sem parenteses/pontuacao final -> antes de ' | ', ',', ' - ', ' — ' -> primeira palavra (3+ letras)."""
+    base = str(valor or "").strip()
+    out = []
+    def add(t):
+        t = re.sub(r"\s+", " ", str(t or "")).strip(" .;:,-—|")
+        if len(t) >= 3 and _norm_txt(t) != _norm_txt(base) and all(_norm_txt(t) != _norm_txt(x) for x in out):
+            out.append(t)
+    add(re.sub(r"\([^)]*\)", " ", base))
+    add(re.split(r"\s*(?:\||,|\s-\s|—|;)\s*", re.sub(r"\([^)]*\)", " ", base))[0])
+    add(re.sub(r"\d+\s*(mg|mcg|g|ml|ui|%).*$", " ", re.sub(r"\([^)]*\)", " ", base), flags=re.IGNORECASE))
+    add(re.sub(r"\([^)]*\)", " ", base).split(" ")[0])
+    return out[:3]
+
+
+def _preencher_select2_tolerante(pagina, id_campo, valor, log, nome, exigir_exato=True, contexto=""):
+    """Busca com o termo inteiro; se SEM_RESULTADO, tenta os termos alternativos. Devolve o primeiro
+    resultado que nao seja SEM_RESULTADO e anota 'termo_usado'."""
+    r = _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato, contexto)
+    if r.get("status") != "SEM_RESULTADO":
+        return r
+    for termo in _termos_alternativos(valor):
+        log.append(f"{nome}: repetindo a busca com '{termo[:40]}'")
+        r2 = _preencher_select2_id(pagina, id_campo, termo, log, nome, exigir_exato, contexto)
+        if r2.get("status") != "SEM_RESULTADO":
+            r2["termo_usado"] = termo
+            if r2.get("status") == "OK":
+                r2["status"] = "APROXIMADO"
+            return r2
+    return r
+
+
 def _preencher_texto_id(pagina, id_campo, valor, log, nome, tipo):
     """input de texto, textarea simples, inteiro ou dinheiro (input-money: digita so os digitos,
     a mascara formata; confere pelos centavos)."""
@@ -2186,7 +2220,7 @@ def preencher_nt():
                     ctx = ""
                     if id_campo == "txtDcbComercial":
                         ctx = str((resultado.get("txtDcb") or {}).get("lido") or campos.get("txtDcb") or "")
-                    r = _preencher_select2_id(form, id_campo, valor, log, nome, exigir_exato, ctx)
+                    r = _preencher_select2_tolerante(form, id_campo, valor, log, nome, exigir_exato, ctx)
                 elif tipo == "ckeditor":
                     r = _preencher_ckeditor_id(form, id_campo, valor, log, nome)
                 else:
@@ -2194,6 +2228,17 @@ def preencher_nt():
                 resultado[id_campo] = r
 
             falhas = [k for k, v in resultado.items() if v.get("status") in ("FALHOU", "AMBIGUO", "SEM_RESULTADO", "LONGO")]
+            # (20/09/2026 k) So a falha num campo OBRIGATORIO impede o 'Salvar Tecnologia'. Falha num campo
+            # opcional (ex.: Nome comercial sem resultado na busca) e devolvida em 'falhas_opcionais' e a
+            # tecnologia e salva com o resto (NT 572428 ficou sem gravar 32 campos por causa de 1 opcional).
+            # A lista de obrigatorios vem no corpo ('obrigatorios'); sem ela, toda falha bloqueia (comportamento antigo).
+            obrigatorios = dados.get("obrigatorios")
+            if isinstance(obrigatorios, list) and obrigatorios:
+                obrig = set(str(x) for x in obrigatorios)
+                falhas_opcionais = [k for k in falhas if k not in obrig]
+                falhas = [k for k in falhas if k in obrig]
+            else:
+                falhas_opcionais = []
             depois_preencher = _ler_campos_nt(form)
             shot_antes = _screenshot_b64(form) if captura else None
 
@@ -2202,7 +2247,7 @@ def preencher_nt():
             verificacao = ""
             if salvar:
                 if falhas:
-                    log.append(f"NAO salvo: {len(falhas)} campo(s) com falha — corrija e chame de novo")
+                    log.append(f"NAO salvo: {len(falhas)} campo(s) obrigatorio(s) com falha — corrija e chame de novo")
                 else:
                     try:
                         botao = form.locator("button, a, input[type='submit'], input[type='button']").filter(
@@ -2293,6 +2338,7 @@ def preencher_nt():
                 "verificacao": verificacao if salvar else "",
                 "resultado": resultado,
                 "falhas": falhas,
+                "falhas_opcionais": falhas_opcionais,
                 "pulados": pulados,
                 "antes": antes,
                 "depois": depois_salvar if depois_salvar is not None else depois_preencher,
