@@ -610,7 +610,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20i"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20j"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -1609,8 +1609,32 @@ def campos(nt):
                 abas = form.evaluate("""() => Array.from(document.querySelectorAll('.nav-tabs li, ul.nav li, .tab-pane')).map(e => ({ tag: e.tagName.toLowerCase(), id: e.id || '', classe: (e.className || '').toString().slice(0, 60), texto: (e.innerText || '').trim().slice(0, 60) })).slice(0, 40)""") or []
             except Exception:
                 abas = []
+            # (20/09/2026 j) ?html=1: devolve o HTML da pagina sem scripts/estilos/CKEditor (para mapear a
+            # estrutura das abas de tecnologia e os botoes 'Salvar Tecnologia' / '+ Adicionar Tecnologia',
+            # que nao aparecem na lista de botoes na carga da pagina) e uma captura da pagina inteira.
+            html_pagina = None
+            captura_pagina = None
+            if str(request.args.get("html") or "") in ("1", "true", "sim"):
+                try:
+                    form.mouse.wheel(0, 20000)
+                    form.wait_for_timeout(1500)
+                    html_pagina = form.evaluate("""() => {
+                        const doc = document.documentElement.cloneNode(true);
+                        doc.querySelectorAll('script, style, link, noscript, svg, iframe, .cke, [class*="cke_"]').forEach(e => e.remove());
+                        doc.querySelectorAll('select').forEach(s => { const keep = Array.from(s.options).filter(o => o.selected).slice(0, 1); s.innerHTML = keep.map(o => '<option selected>' + o.text + '</option>').join(''); });
+                        return doc.outerHTML.replace(/\\s+\\n/g, '\\n');
+                    }""")
+                    if html_pagina and len(html_pagina) > 400000:
+                        html_pagina = html_pagina[:400000] + "\n<!-- cortado -->"
+                except Exception as e_h:
+                    html_pagina = f"<!-- falhou: {type(e_h).__name__} -->"
+                captura_pagina = _screenshot_b64(form)
             browser.close()
-            return jsonify({"numeroNT": nt, "tipo": tipo_forcado, "total": len(dados), "campos": dados, "botoes": botoes, "abas": abas})
+            saida = {"numeroNT": nt, "tipo": tipo_forcado, "total": len(dados), "campos": dados, "botoes": botoes, "abas": abas}
+            if html_pagina is not None:
+                saida["html"] = html_pagina
+                saida["screenshot"] = captura_pagina
+            return jsonify(saida)
         except Exception as e:
             sc = _screenshot_b64(page)
             try:
