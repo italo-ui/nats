@@ -610,7 +610,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20h"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20i"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -1595,9 +1595,12 @@ def campos(nt):
             # '+ Adicionar Tecnologia' e 'Salvar e Finalizar' sem clicar em nada.
             botoes = []
             try:
+                # (20/09/2026 i) visibilidade por geometria: botoes em barra fixa (position:fixed) tem
+                # offsetParent null e sumiam da lista — 'Salvar Tecnologia' e '+ Adicionar Tecnologia' entre eles.
                 botoes = form.evaluate("""() => Array.from(document.querySelectorAll('a, button, input[type=submit], input[type=button]'))
-                    .filter(e => e.offsetParent)
-                    .map(e => ({ tag: e.tagName.toLowerCase(), texto: (e.innerText || e.value || '').trim().slice(0, 80), href: (e.getAttribute('href') || '').slice(0, 200), onclick: (e.getAttribute('onclick') || '').slice(0, 200), id: e.id || '', classe: (e.className || '').toString().slice(0, 80) }))
+                    .map(e => { const r = e.getBoundingClientRect(); const s = window.getComputedStyle(e);
+                        return { tag: e.tagName.toLowerCase(), texto: (e.innerText || e.value || '').trim().slice(0, 80), href: (e.getAttribute('href') || '').slice(0, 200), onclick: (e.getAttribute('onclick') || '').slice(0, 200), id: e.id || '', classe: (e.className || '').toString().slice(0, 80), tipo: e.type || '',
+                            visivel: r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden', fixo: s.position === 'fixed' || s.position === 'sticky' }; })
                     .filter(b => b.texto)""") or []
             except Exception:
                 botoes = []
@@ -2373,7 +2376,7 @@ def finalizar_nt():
             if botao.count() == 0:
                 botao = form.locator("input[value*='Finalizar']").first
             if botao.count() == 0:
-                vis = form.evaluate("""() => Array.from(document.querySelectorAll('a, button, input[type=submit], input[type=button]')).filter(e => e.offsetParent).map(e => (e.innerText || e.value || '').trim()).filter(Boolean).slice(0, 40)""") or []
+                vis = form.evaluate("""() => Array.from(document.querySelectorAll('a, button, input[type=submit], input[type=button]')).filter(e => { const r = e.getBoundingClientRect(); const s = window.getComputedStyle(e); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; }).map(e => (e.innerText || e.value || '').trim()).filter(Boolean).slice(0, 40)""") or []
                 browser.close()
                 return jsonify({"numeroNT": nt, "finalizada": False, "erro": "botao 'Salvar e Finalizar' nao encontrado", "botoes_visiveis": vis, "log": log})
             botao.wait_for(state="visible", timeout=8000)
@@ -2410,7 +2413,7 @@ def finalizar_nt():
             try:
                 pagina2 = _navegar_ate_pagina_nt(context, page, nt)
                 pagina2.wait_for_timeout(1500)
-                botoes_depois = pagina2.evaluate("""() => Array.from(document.querySelectorAll('a, button, input[type=submit], input[type=button]')).filter(e => e.offsetParent).map(e => (e.innerText || e.value || '').trim()).filter(Boolean).slice(0, 60)""") or []
+                botoes_depois = pagina2.evaluate("""() => Array.from(document.querySelectorAll('a, button, input[type=submit], input[type=button]')).filter(e => { const r = e.getBoundingClientRect(); const s = window.getComputedStyle(e); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; }).map(e => (e.innerText || e.value || '').trim()).filter(Boolean).slice(0, 60)""") or []
                 emissao = any(re.search(r"emiss[aã]o|emitir", b, re.IGNORECASE) for b in botoes_depois)
                 texto_pag = ""
                 try:
