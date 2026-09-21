@@ -610,7 +610,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20k"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20l"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -1612,6 +1612,7 @@ def campos(nt):
             # (20/09/2026 j) ?html=1: devolve o HTML da pagina sem scripts/estilos/CKEditor (para mapear a
             # estrutura das abas de tecnologia e os botoes 'Salvar Tecnologia' / '+ Adicionar Tecnologia',
             # que nao aparecem na lista de botoes na carga da pagina) e uma captura da pagina inteira.
+            tecnologias_nt = _tecnologias_da_nt(form)
             html_pagina = None
             captura_pagina = None
             if str(request.args.get("html") or "") in ("1", "true", "sim"):
@@ -1630,7 +1631,7 @@ def campos(nt):
                     html_pagina = f"<!-- falhou: {type(e_h).__name__} -->"
                 captura_pagina = _screenshot_b64(form)
             browser.close()
-            saida = {"numeroNT": nt, "tipo": tipo_forcado, "total": len(dados), "campos": dados, "botoes": botoes, "abas": abas}
+            saida = {"numeroNT": nt, "tipo": tipo_forcado, "total": len(dados), "campos": dados, "botoes": botoes, "abas": abas, "tecnologias": tecnologias_nt}
             if html_pagina is not None:
                 saida["html"] = html_pagina
                 saida["screenshot"] = captura_pagina
@@ -1997,6 +1998,34 @@ def _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato=True,
             pass
         log.append(f"{nome}: FALHOU ({type(e).__name__}: {str(e)[:90]})")
         return {"status": "FALHOU", "motivo": str(e)[:120]}
+
+
+def _tecnologias_da_nt(pagina):
+    """(20/09/2026 l) Le a estrutura de tecnologias da pagina da NT (mapeada na NT 569405):
+    - ul.nav-notatecnica: uma aba por tecnologia ('NT <id>', a principal e as filhas) + '+ Adicionar Tecnologia'
+      (ajaxPost com idNotaTecnicaPai=<nt>: cada tecnologia e uma nota-filha com id proprio e o MESMO formulario);
+    - #tabela-associada: Nota | Tecnologia | Conclusao | Status de cada tecnologia;
+    - botao 'Realizar emissao': fica DESABILITADO enquanto houver tecnologia pendente (#aviso-associada).
+    Somente leitura."""
+    try:
+        return pagina.evaluate("""() => {
+            const txt = e => (e && (e.innerText || e.value) || '').replace(/\\s+/g, ' ').trim();
+            const abas = Array.from(document.querySelectorAll('ul.nav-notatecnica li')).map(li => {
+                const a = li.querySelector('a'); const oc = a ? (a.getAttribute('onclick') || '') : '';
+                const m = oc.match(/idNotaTecnica(Pai)?=(\\d+)/);
+                return { texto: txt(a), ativa: /active/.test(li.className || ''), adicionar: /Pai=/.test(oc), id: m ? m[2] : '', onclick: oc.slice(0, 160) };
+            });
+            const linhas = Array.from(document.querySelectorAll('#tabela-associada tbody tr')).map(tr => {
+                const td = Array.from(tr.querySelectorAll('td')).map(txt);
+                return { nota: td[0] || '', tecnologia: td[1] || '', conclusao: td[2] || '', status: td[3] || '', classe: tr.className || '' };
+            });
+            const botoes = Array.from(document.querySelectorAll('button, a, input[type=submit], input[type=button]'));
+            const bEm = botoes.find(b => /realizar\\s+emiss/i.test(txt(b)));
+            const aviso = txt(document.getElementById('aviso-associada'));
+            return { abas, tecnologias: linhas, emissao: { presente: !!bEm, habilitado: !!bEm && !bEm.disabled && !/disabled/.test(bEm.getAttribute('class') || ''), texto: txt(bEm) }, aviso, id_ativo: (document.getElementById('idNotaTecnica') || {}).value || '' };
+        }""") or {}
+    except Exception as e:
+        return {"erro": f"{type(e).__name__}: {str(e)[:120]}"}
 
 
 def _termos_alternativos(valor):
@@ -2480,17 +2509,29 @@ def finalizar_nt():
             # reabre a pagina da NT e le o que ficou: botao de emissao visivel? 'Salvar Tecnologia' sumiu?
             emissao = False
             botoes_depois = []
+            tecnologias_depois = None
             try:
                 pagina2 = _navegar_ate_pagina_nt(context, page, nt)
                 pagina2.wait_for_timeout(1500)
                 botoes_depois = pagina2.evaluate("""() => Array.from(document.querySelectorAll('a, button, input[type=submit], input[type=button]')).filter(e => { const r = e.getBoundingClientRect(); const s = window.getComputedStyle(e); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden'; }).map(e => (e.innerText || e.value || '').trim()).filter(Boolean).slice(0, 60)""") or []
-                emissao = any(re.search(r"emiss[aã]o|emitir", b, re.IGNORECASE) for b in botoes_depois)
-                texto_pag = ""
-                try:
-                    texto_pag = pagina2.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
-                except Exception:
+                # (20/09/2026 l) 'Realizar emissao' esta SEMPRE na pagina, desabilitado enquanto houver tecnologia
+                # pendente: so conta como disponivel se estiver habilitado. A finalizacao desta tecnologia e lida
+                # na tabela associada (Status da linha desta NT deixa de ser 'Aguardando analise').
+                tecnologias_depois = _tecnologias_da_nt(pagina2)
+                emissao = bool(((tecnologias_depois or {}).get("emissao") or {}).get("habilitado"))
+                linha_nt = next((t for t in (tecnologias_depois or {}).get("tecnologias", []) if str(t.get("nota")) == nt), None)
+                st_linha = str((linha_nt or {}).get("status") or "")
+                if linha_nt and st_linha:
+                    finalizada = emissao or not re.search(r"aguardando", st_linha, re.IGNORECASE)
+                else:
                     texto_pag = ""
-                finalizada = emissao or bool(re.search(r"finalizad", texto_pag, re.IGNORECASE))
+                    try:
+                        texto_pag = pagina2.evaluate("() => (document.body.innerText || '').slice(0, 20000)") or ""
+                    except Exception:
+                        texto_pag = ""
+                    finalizada = emissao or bool(re.search(r"finalizad", texto_pag, re.IGNORECASE))
+                if linha_nt:
+                    log.append(f"tabela de tecnologias: NT {nt} -> status '{st_linha}'" + (f" | aviso: {tecnologias_depois.get('aviso')}" if tecnologias_depois.get('aviso') else ""))
             except Exception as e_r:
                 finalizada = not validacao and not any(re.search(r"obrigat|inv[aá]lid|erro", d, re.IGNORECASE) for d in dialogos)
                 log.append(f"nao foi possivel reabrir a NT para conferir ({type(e_r).__name__})")
@@ -2501,7 +2542,7 @@ def finalizar_nt():
             log.append(("Tecnologia FINALIZADA" if finalizada else "Finalizacao NAO confirmada") + (" — botao de emissao visivel na NT (emitir continua sendo o seu clique)" if emissao else ""))
             sc = _screenshot_b64(page) if captura else None
             browser.close()
-            return jsonify({"numeroNT": nt, "finalizada": bool(finalizada), "emissao_disponivel": bool(emissao), "botao_clicado": "Salvar e Finalizar Tecnologia", "dialogos": dialogos, "validacao": validacao, "botoes_depois": botoes_depois, "log": log, "screenshot": sc})
+            return jsonify({"numeroNT": nt, "finalizada": bool(finalizada), "emissao_disponivel": bool(emissao), "botao_clicado": "Salvar e Finalizar Tecnologia", "dialogos": dialogos, "validacao": validacao, "botoes_depois": botoes_depois, "tecnologias": tecnologias_depois, "log": log, "screenshot": sc})
         except Exception as e:
             sc = _screenshot_b64(page) if captura else None
             try:
