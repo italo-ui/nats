@@ -611,7 +611,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20n"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20o"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -2101,11 +2101,9 @@ def _cmed_buscar(q, limite=60):
 
 @app.route("/cmed", methods=["GET"])
 def cmed_consulta():
-    """?q=<texto da tecnologia>&limite=60 — sem navegador, sem lock. Somente leitura."""
-    if NAT_API_KEY:
-        chave = request.headers.get("x-api-key", "") or request.args.get("chave", "")
-        if not hmac.compare_digest(chave, NAT_API_KEY):
-            return jsonify({"erro": "nao autorizado"}), 401
+    """?q=<texto da tecnologia>&limite=60 — sem navegador, sem lock. Somente leitura.
+    (20/09/2026 o) a chave e conferida pelo before_request (X-Nat-Key), como nas demais rotas; a
+    conferencia extra por x-api-key que existia aqui devolvia 401 ao n8n."""
     if not _CMED["linhas"] and not _CMED["erro"]:
         _carregar_cmed()
     q = str(request.args.get("q") or "").strip()
