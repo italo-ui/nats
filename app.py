@@ -41,6 +41,7 @@ _lock_ocr = threading.Lock()
 # chama o Railway — mesmo modelo ja usado para a chave do Gemini.
 # ============================================================
 NAT_API_KEY = os.environ.get("NAT_API_KEY", "").strip()
+# (20/09/2026 n) a lista CMED e carregada na primeira consulta a /cmed (ver _carregar_cmed)
 
 
 @app.before_request
@@ -610,7 +611,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20l"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20n"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -831,13 +832,31 @@ def _cache_gravar(nt, payload):
         pass
 
 
+_RE_RODAPE_PJE = re.compile(
+    r"^\s*(Assinado eletronicamente por:.*|N[uú]mero do documento:.*|https?://\S+.*|Num\.\s*\d+\s*-\s*P[aá]g\.\s*\d+.*|"
+    r"Documento assinado.*|Este documento pode ser verificado.*|Pagina\s+\d+\s+de\s+\d+.*|P[aá]gina\s+\d+\s+de\s+\d+.*)$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _sem_rodape_pje(t):
+    """(20/09/2026 m) Remove o rodape que o PJe carimba em TODA pagina ('Assinado eletronicamente por',
+    'Numero do documento', o link e 'Num. X - Pag. Y'). Numa pagina digitalizada esse rodape e o unico
+    texto extraivel, e fazia a pagina parecer legivel: a NT 569820 saiu com 94 paginas 'ok' e nenhuma
+    linha do laudo (27 mil caracteres, quase tudo rodape) — a tecnologia ficou 'nao identificada'."""
+    return _RE_RODAPE_PJE.sub("", str(t or ""))
+
+
 def _texto_ruim(t):
-    """True se o texto da pagina parece ilegivel: vazio, poucos chars ou lixo de fonte (cid)."""
-    if not t or len(t.strip()) < 100:
+    """True se o texto da pagina parece ilegivel: vazio, poucos chars (descontado o rodape do PJe)
+    ou lixo de fonte (cid)."""
+    if not t:
+        return True
+    util = _sem_rodape_pje(t)
+    if len(util.strip()) < 100:
         return True
     cid = t.count("(cid:")
-    letras = sum(1 for c in t if c.isalpha())
-    ratio = letras / max(len(t), 1)
+    letras = sum(1 for c in util if c.isalpha())
+    ratio = letras / max(len(util), 1)
     return cid > 20 or ratio < 0.5
 def _otsu_threshold(hist):
     """Limiar de Otsu (binarizacao) a partir do histograma de cinza, em Python puro."""
@@ -2000,6 +2019,145 @@ def _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato=True,
         return {"status": "FALHOU", "motivo": str(e)[:120]}
 
 
+# ─────────────────────────────────────────────
+# CMED (20/09/2026 n): lista de precos publicada pela SE/CMED, entregue pelo Italo como planilha e
+# compactada em cmed_*.csv.gz ao lado deste arquivo (colunas: substancia, produto, laboratorio,
+# apresentacao, ggrem, registro, classe, tipo, regime, pf_*, pmvg_*, pmc_*, restricao_hospitalar...).
+# A rota /cmed?q=<termo> devolve as apresentacoes que casam com as palavras do termo, para o no 05
+# do Processamento por o bloco <cmed> no prompt (fonte primaria de PF/PMVG/PMC, ICMS 18% = Ceara).
+# ─────────────────────────────────────────────
+_CMED = {"linhas": [], "arquivo": "", "publicada": "", "erro": ""}
+
+
+def _cmed_norm(t):
+    return _norm_txt(str(t or ""))
+
+
+def _carregar_cmed():
+    import csv, glob, gzip
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+        arqs = sorted(glob.glob(os.path.join(base, "cmed_*.csv.gz")) + glob.glob(os.path.join(base, "cmed_*.csv")))
+        if not arqs:
+            _CMED["erro"] = "arquivo cmed_*.csv(.gz) nao encontrado ao lado do app.py"
+            return
+        arq = arqs[-1]
+        m = re.search(r"cmed_(\d{4})-(\d{2})-(\d{2})", os.path.basename(arq))
+        _CMED["publicada"] = f"{m.group(3)}/{m.group(2)}/{m.group(1)}" if m else ""
+        abrir = (lambda: gzip.open(arq, "rt", encoding="utf-8", newline="")) if arq.endswith(".gz") else (lambda: open(arq, "r", encoding="utf-8", newline=""))
+        linhas = []
+        with abrir() as f:
+            for r in csv.DictReader(f):
+                r["_n"] = _cmed_norm(r.get("substancia", "")) + " | " + _cmed_norm(r.get("produto", ""))
+                linhas.append(r)
+        _CMED["linhas"] = linhas
+        _CMED["arquivo"] = os.path.basename(arq)
+        _CMED["erro"] = ""
+    except Exception as e:
+        _CMED["erro"] = f"{type(e).__name__}: {str(e)[:160]}"
+
+
+_CMED_STOP = set("""mg mcg ml g ui comprimido comprimidos capsula capsulas frasco frascos ampola ampolas solucao injetavel oral uso continuo
+caixa caixas unidade unidades mensal mensais tratamento medicamento medicamentos dose doses dia dias vezes cada horas hora semana semanas
+mes meses ano anos por para com sem nome comercial generico similar referencia adulto pediatrico sc iv im via posologia prescrito
+prescricao total anual laboratorio apresentacao registro anvisa cmed pmvg pmc preco valor custo tecnologia procedimento produto""".split())
+
+
+def _cmed_termos(q):
+    q = _cmed_norm(q)
+    pal = [w for w in re.split(r"[^a-z0-9]+", q) if len(w) >= 4 and w not in _CMED_STOP and not re.match(r"^\d+$", w)]
+    vistos = []
+    for w in pal:
+        if w not in vistos:
+            vistos.append(w)
+    return vistos[:12]
+
+
+def _cmed_buscar(q, limite=60):
+    termos = _cmed_termos(q)
+    if not termos or not _CMED["linhas"]:
+        return termos, []
+    achados = []
+    for r in _CMED["linhas"]:
+        n = r["_n"]
+        hits = [t for t in termos if t in n]
+        if hits:
+            achados.append((len(hits), r))
+    achados.sort(key=lambda x: (-x[0], x[1].get("substancia", ""), x[1].get("produto", ""), x[1].get("apresentacao", "")))
+    # equilibra entre substancias distintas (pedido com 3 medicamentos nao pode ficar so com o primeiro)
+    por_sub = {}
+    out = []
+    for h, r in achados:
+        sub = r.get("substancia", "")
+        por_sub.setdefault(sub, 0)
+        if por_sub[sub] >= max(8, limite // max(1, len(termos))):
+            continue
+        por_sub[sub] += 1
+        out.append({k: v for k, v in r.items() if not k.startswith("_")})
+        if len(out) >= limite:
+            break
+    return termos, out
+
+
+@app.route("/cmed", methods=["GET"])
+def cmed_consulta():
+    """?q=<texto da tecnologia>&limite=60 — sem navegador, sem lock. Somente leitura."""
+    if NAT_API_KEY:
+        chave = request.headers.get("x-api-key", "") or request.args.get("chave", "")
+        if not hmac.compare_digest(chave, NAT_API_KEY):
+            return jsonify({"erro": "nao autorizado"}), 401
+    if not _CMED["linhas"] and not _CMED["erro"]:
+        _carregar_cmed()
+    q = str(request.args.get("q") or "").strip()
+    try:
+        limite = max(1, min(120, int(request.args.get("limite") or 60)))
+    except Exception:
+        limite = 60
+    if not q:
+        return jsonify({"publicada": _CMED["publicada"], "arquivo": _CMED["arquivo"], "total": len(_CMED["linhas"]), "erro": _CMED["erro"] or None})
+    termos, linhas = _cmed_buscar(q, limite)
+    return jsonify({"publicada": _CMED["publicada"], "arquivo": _CMED["arquivo"], "termos": termos, "encontrados": len(linhas), "linhas": linhas, "erro": _CMED["erro"] or None})
+
+
+def _abrir_tecnologia(pagina, tec, log):
+    """(20/09/2026 n) Varias tecnologias = notas-filhas com o MESMO formulario, uma aba por tecnologia
+    (ul.nav-notatecnica). tec = None (nota principal) | {"id": "<id da filha>"} | {"nova": true}
+    (clica em '+ Adicionar Tecnologia', que abre o formulario de uma filha ainda sem id). O conteudo
+    troca por ajax (#conteudo); espera o formulario da tecnologia aparecer."""
+    if not tec or not isinstance(tec, dict):
+        return None
+    if tec.get("id"):
+        alvo = pagina.locator("ul.nav-notatecnica li a").filter(has_text=re.compile(r"^\s*NT\s*" + re.escape(str(tec["id"])) + r"\s*$", re.IGNORECASE))
+        if alvo.count() == 0:
+            alvo = pagina.locator(f"ul.nav-notatecnica li a[onclick*='idNotaTecnica={tec['id']}&']")
+        if alvo.count() == 0:
+            raise Exception(f"aba da tecnologia {tec['id']} nao encontrada na NT")
+        alvo.first.click()
+        rotulo = "NT " + str(tec["id"])
+    elif tec.get("nova"):
+        alvo = pagina.locator("ul.nav-notatecnica li a").filter(has_text=re.compile(r"Adicionar\s+Tecnologia", re.IGNORECASE))
+        if alvo.count() == 0:
+            raise Exception("'+ Adicionar Tecnologia' nao encontrado na NT")
+        alvo.first.click()
+        rotulo = "+ Adicionar Tecnologia"
+    else:
+        return None
+    pagina.wait_for_timeout(1500)
+    pagina.wait_for_selector("#selTipoTecnologia", state="attached", timeout=20000)
+    try:
+        pagina.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    pagina.wait_for_timeout(800)
+    ativo = ""
+    try:
+        ativo = pagina.evaluate("() => (document.getElementById('idNotaTecnica') || {}).value || ''") or ""
+    except Exception:
+        ativo = ""
+    log.append(f"Tecnologia aberta: {rotulo} (idNotaTecnica do formulario: {ativo or 'vazio'})")
+    return ativo
+
+
 def _tecnologias_da_nt(pagina):
     """(20/09/2026 l) Le a estrutura de tecnologias da pagina da NT (mapeada na NT 569405):
     - ul.nav-notatecnica: uma aba por tecnologia ('NT <id>', a principal e as filhas) + '+ Adicionar Tecnologia'
@@ -2210,6 +2368,9 @@ def preencher_nt():
     if not isinstance(campos, dict) or not campos:
         return jsonify({"erro": "campos {id: valor} obrigatorio"}), 400
     desconhecidos = [k for k in campos if k not in CAMPOS_NT_POR_ID]
+    # (20/09/2026 n) tecnologia: None = nota principal; {"id": "<filha>"} = aba de uma tecnologia ja criada;
+    # {"nova": true} = clicar em '+ Adicionar Tecnologia' e preencher a nova filha (o id nasce ao salvar).
+    tecnologia = dados.get("tecnologia") if isinstance(dados.get("tecnologia"), dict) else None
     salvar = bool(dados.get("salvar", False))
     exigir_exato = bool(dados.get("exigir_exato", True))
     ler_antes = bool(dados.get("ler_antes", True))
@@ -2226,6 +2387,12 @@ def preencher_nt():
             _exigir_sessao(context, page)
             form = _navegar_ate_formulario(context, page, nt)
             log.append("Formulario da NT localizado")
+            tecnologias_antes = _tecnologias_da_nt(form) if tecnologia else None
+            id_filha = ""
+            if tecnologia:
+                _abrir_tecnologia(form, tecnologia, log)
+                if tecnologia.get("id"):
+                    id_filha = str(tecnologia.get("id"))
             antes = _ler_campos_nt(form) if ler_antes else None
 
             resultado = {}
@@ -2318,6 +2485,19 @@ def preencher_nt():
                         verificacao = ""
                         try:
                             form2 = _navegar_ate_formulario(context, page, nt)
+                            if tecnologia:
+                                # (20/09/2026 n) a filha nova ganha id ao salvar: e a linha que apareceu na tabela
+                                tec_depois = _tecnologias_da_nt(form2) or {}
+                                if tecnologia.get("nova"):
+                                    antes_ids = set(str(t.get("nota")) for t in ((tecnologias_antes or {}).get("tecnologias") or []))
+                                    novas = [str(t.get("nota")) for t in (tec_depois.get("tecnologias") or []) if str(t.get("nota")) not in antes_ids]
+                                    if novas:
+                                        id_filha = novas[0]
+                                        log.append(f"Tecnologia nova criada: NT {id_filha}")
+                                    else:
+                                        log.append("ATENCAO: nenhuma tecnologia nova apareceu na tabela depois de salvar")
+                                if id_filha:
+                                    _abrir_tecnologia(form2, {"id": id_filha}, log)
                             depois_salvar = _ler_campos_nt(form2)
                             iguais, difs = 0, []
                             for k, v in campos.items():
@@ -2369,6 +2549,8 @@ def preencher_nt():
                 "falhas": falhas,
                 "falhas_opcionais": falhas_opcionais,
                 "pulados": pulados,
+                "tecnologia": tecnologia,
+                "id_filha": id_filha or None,
                 "antes": antes,
                 "depois": depois_salvar if depois_salvar is not None else depois_preencher,
                 "log": log,
@@ -2459,6 +2641,8 @@ def finalizar_nt():
     dados = request.json or {}
     nt = str(dados.get("numeroNT") or "").strip()
     captura = bool(dados.get("captura", True))
+    tecnologia = dados.get("tecnologia") if isinstance(dados.get("tecnologia"), dict) else None
+    nt_ref = str((tecnologia or {}).get("id") or nt)   # linha da tabela que descreve ESTA tecnologia
     if not nt:
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
     log = []
@@ -2470,6 +2654,8 @@ def finalizar_nt():
             _exigir_sessao(context, page)
             form = _navegar_ate_formulario(context, page, nt)
             log.append("Formulario da NT localizado")
+            if tecnologia and tecnologia.get("id"):
+                _abrir_tecnologia(form, {"id": tecnologia["id"]}, log)
             re_fin = re.compile(r"^\s*Salvar\s+e\s+Finalizar(\s+Tecnologia)?\s*$", re.IGNORECASE)
             botao = form.locator("button, a, input[type='submit'], input[type='button']").filter(has_text=re_fin).first
             if botao.count() == 0:
@@ -2519,7 +2705,7 @@ def finalizar_nt():
                 # na tabela associada (Status da linha desta NT deixa de ser 'Aguardando analise').
                 tecnologias_depois = _tecnologias_da_nt(pagina2)
                 emissao = bool(((tecnologias_depois or {}).get("emissao") or {}).get("habilitado"))
-                linha_nt = next((t for t in (tecnologias_depois or {}).get("tecnologias", []) if str(t.get("nota")) == nt), None)
+                linha_nt = next((t for t in (tecnologias_depois or {}).get("tecnologias", []) if str(t.get("nota")) == nt_ref), None)
                 st_linha = str((linha_nt or {}).get("status") or "")
                 if linha_nt and st_linha:
                     finalizada = emissao or not re.search(r"aguardando", st_linha, re.IGNORECASE)
@@ -2531,7 +2717,7 @@ def finalizar_nt():
                         texto_pag = ""
                     finalizada = emissao or bool(re.search(r"finalizad", texto_pag, re.IGNORECASE))
                 if linha_nt:
-                    log.append(f"tabela de tecnologias: NT {nt} -> status '{st_linha}'" + (f" | aviso: {tecnologias_depois.get('aviso')}" if tecnologias_depois.get('aviso') else ""))
+                    log.append(f"tabela de tecnologias: NT {nt_ref} -> status '{st_linha}'" + (f" | aviso: {tecnologias_depois.get('aviso')}" if tecnologias_depois.get('aviso') else ""))
             except Exception as e_r:
                 finalizada = not validacao and not any(re.search(r"obrigat|inv[aá]lid|erro", d, re.IGNORECASE) for d in dialogos)
                 log.append(f"nao foi possivel reabrir a NT para conferir ({type(e_r).__name__})")
