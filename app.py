@@ -611,7 +611,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-20o"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-22p"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -2336,6 +2336,93 @@ def _ler_campos_nt(pagina):
     }""", [[c[0], c[1]] for c in CAMPOS_NT])
 
 
+# (22/09/2026 p) IDENTIFICACAO DA NT NAS TECNOLOGIAS FILHAS. No e-NatJus cada tecnologia e uma nota-filha com o
+# MESMO formulario, inclusive os campos de identificacao (CID, diagnostico, meios confirmatorios, NatJus
+# responsavel, instituicao, tutoria). A distribuicao (/preencher, no NATJUS2) so preenche esses campos na nota
+# principal; a filha criada em '+ Adicionar Tecnologia' nasce com eles vazios e o e-NatJus recusa salvar sem
+# eles. Regra do Italo (22/09): a NT e global, as tecnologias 2, 3... devem ter a identificacao igual a da
+# primeira. Por isso o /preencher-nt, quando abre uma filha, le esses campos na aba principal e copia os que
+# estiverem vazios (ou diferentes) na filha, antes de preencher o resto e salvar.
+IDENTIFICACAO_NT = [
+    # chave, rotulo no formulario, tipo ('texto' | 'select'), regex do termo de busca (select2)
+    ("cid", "CID", "select", r"^[A-Z]\d{2}(?:\.\d{1,2})?"),
+    ("diagnostico", "Diagnóstico", "texto", None),
+    ("meios_confirmatorios", "Meio(s) confirmatório(s) do diagnóstico já realizado(s)", "texto", None),
+    ("natjus_responsavel", "NatJus Responsável", "select", None),
+    ("instituicao_responsavel", "Instituição Responsável", "texto", None),
+    ("apoio_tutoria", "Nota técnica elaborada com apoio de tutoria?", "select", None),
+]
+
+
+def _ler_identificacao(pagina):
+    """Le os campos de identificacao da tecnologia ATIVA pelo rotulo (mesma ancoragem do _grupo_do_rotulo:
+    casamento exato do rotulo, aceitando o asterisco; 'CID' nao pode casar com 'Cidade'). Devolve
+    {chave: texto} — para <select> comum o texto da opcao; para select2 o texto exibido no widget; para
+    input/textarea o value. Somente leitura."""
+    rotulos = [[c[0], c[1]] for c in IDENTIFICACAO_NT]
+    try:
+        return pagina.evaluate("""(lista) => {
+            const norm = t => String(t || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+            const out = {};
+            const labels = Array.from(document.querySelectorAll('label'));
+            for (const [chave, rotulo] of lista) {
+                const re = new RegExp('^\\\\s*' + rotulo.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&') + '\\\\s*\\\\*?\\\\s*$', 'i');
+                let lab = labels.find(l => re.test(norm(l.innerText)) && l.offsetParent);
+                if (!lab) lab = labels.find(l => norm(l.innerText).toLowerCase().indexOf(rotulo.toLowerCase()) >= 0 && l.offsetParent);
+                if (!lab) { out[chave] = ''; continue; }
+                const grupo = lab.closest('.form-group') || lab.parentElement;
+                let v = '';
+                const sel = grupo.querySelector('select');
+                if (sel) {
+                    const op = sel.options[sel.selectedIndex]; v = op ? op.text : '';
+                    const w = grupo.querySelector('.select2-selection__rendered, .select2-chosen');
+                    if (w) { const t = norm(w.getAttribute('title') || w.innerText); if (t) v = t; }
+                    if (/^(selecione|digite|--)/i.test(norm(v))) v = '';
+                } else {
+                    const inp = grupo.querySelector('textarea, input[type=text], input:not([type])');
+                    v = inp ? inp.value : '';
+                }
+                out[chave] = norm(v);
+            }
+            return out;
+        }""", rotulos) or {}
+    except Exception as e:
+        return {"erro": f"{type(e).__name__}: {str(e)[:120]}"}
+
+
+def _copiar_identificacao(pagina, origem, log):
+    """Copia para a tecnologia ATIVA (a filha) os campos de identificacao lidos na principal (origem).
+    So mexe no que esta vazio ou diferente; devolve {chave: 'OK' | 'IGUAL' | 'FALHOU' | 'SEM_ORIGEM'}."""
+    resultado = {}
+    if not isinstance(origem, dict) or origem.get("erro"):
+        log.append("Identificacao: nao foi possivel ler a nota principal (" + str((origem or {}).get("erro", "vazio"))[:80] + ")")
+        return {c[0]: "SEM_ORIGEM" for c in IDENTIFICACAO_NT}
+    atual = _ler_identificacao(pagina)
+    if not isinstance(atual, dict) or atual.get("erro"):
+        atual = {}
+    for chave, rotulo, tipo, rx in IDENTIFICACAO_NT:
+        valor = str(origem.get(chave) or "").strip()
+        if not valor:
+            resultado[chave] = "SEM_ORIGEM"
+            continue
+        ja = str(atual.get(chave) or "").strip()
+        if ja and _norm_txt(ja) == _norm_txt(valor):
+            resultado[chave] = "IGUAL"
+            continue
+        if tipo == "select":
+            termo = valor
+            if rx:
+                m = re.match(rx, valor.strip().upper())
+                if m:
+                    termo = m.group(0)
+            ok = _select_por_rotulo(pagina, rotulo, termo, log, "Identificacao/" + chave)
+        else:
+            ok = _texto_por_rotulo(pagina, rotulo, valor, log, "Identificacao/" + chave)
+        resultado[chave] = "OK" if ok else "FALHOU"
+        pagina.wait_for_timeout(200)
+    return resultado
+
+
 @app.route("/preencher-nt", methods=["POST"])
 @_serializado
 def preencher_nt():
@@ -2352,9 +2439,12 @@ def preencher_nt():
       exigir_exato    default true: buscas select2 so aceitam casamento exato (senao AMBIGUO)
       ler_antes       default true: devolve o estado dos campos antes de mexer
       captura         default true: screenshots (antes de salvar / final)
+      copiar_identificacao  default true (22/09/2026 p): numa tecnologia filha ({id} ou {nova}), copia da nota
+                      principal os campos de identificacao (CID, diagnostico, meios confirmatorios, NatJus
+                      responsavel, instituicao, tutoria) que estiverem vazios/diferentes na filha, antes de preencher
 
     Resposta:
-      { sucesso, numeroNT, salvo, resultado: {id: {status, lido, candidatos?}}, falhas: [ids],
+      { sucesso, numeroNT, salvo, identificacao: {chave: OK|IGUAL|FALHOU|SEM_ORIGEM} (so com tecnologia), resultado: {id: {status, lido, candidatos?}}, falhas: [ids],
         pulados: [ids ocultos], antes: {...}, depois: {...}, log: [...], screenshot, screenshot_antes_de_salvar }
       status por campo: OK | APROXIMADO | AMBIGUO | SEM_RESULTADO | OCULTO | VAZIO | LONGO (excede maxlength) | FALHOU
     """
@@ -2373,6 +2463,7 @@ def preencher_nt():
     exigir_exato = bool(dados.get("exigir_exato", True))
     ler_antes = bool(dados.get("ler_antes", True))
     captura = bool(dados.get("captura", True))
+    copiar_ident = bool(dados.get("copiar_identificacao", True))
     log = []
     if desconhecidos:
         log.append("ids ignorados (fora de CAMPOS_NT): " + ", ".join(desconhecidos)[:200])
@@ -2387,10 +2478,28 @@ def preencher_nt():
             log.append("Formulario da NT localizado")
             tecnologias_antes = _tecnologias_da_nt(form) if tecnologia else None
             id_filha = ""
+            identificacao = None
             if tecnologia:
+                # (22/09/2026 p) identificacao da NT: le na principal (aba 'NT <numero>', a que abre por padrao) e,
+                # depois de abrir a filha, copia o que estiver vazio/diferente — a filha nasce sem CID, diagnostico,
+                # meios, NatJus responsavel, instituicao e tutoria, e a NT e uma so.
+                ident_principal = None
+                if copiar_ident:
+                    try:
+                        ativo0 = _tecnologias_da_nt(form) or {}
+                        if str(ativo0.get("id_ativo") or "") not in ("", str(nt)):
+                            _abrir_tecnologia(form, {"id": str(nt)}, log)
+                    except Exception as e_ab:
+                        log.append(f"Identificacao: nao abri a aba principal ({type(e_ab).__name__}); leio a aba ativa")
+                    ident_principal = _ler_identificacao(form)
+                    lidos = [k for k, v in (ident_principal or {}).items() if v and k != "erro"]
+                    log.append("Identificacao lida na nota principal: " + (", ".join(lidos) if lidos else "nada"))
                 _abrir_tecnologia(form, tecnologia, log)
                 if tecnologia.get("id"):
                     id_filha = str(tecnologia.get("id"))
+                if copiar_ident:
+                    identificacao = _copiar_identificacao(form, ident_principal, log)
+                    log.append("Identificacao na filha: " + ", ".join(f"{k}={v}" for k, v in identificacao.items()))
             antes = _ler_campos_nt(form) if ler_antes else None
 
             resultado = {}
@@ -2549,6 +2658,7 @@ def preencher_nt():
                 "pulados": pulados,
                 "tecnologia": tecnologia,
                 "id_filha": id_filha or None,
+                "identificacao": identificacao,
                 "antes": antes,
                 "depois": depois_salvar if depois_salvar is not None else depois_preencher,
                 "log": log,
