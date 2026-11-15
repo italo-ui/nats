@@ -611,7 +611,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-09-22p"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-11-14q"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -2024,7 +2024,10 @@ def _preencher_select2_id(pagina, id_campo, valor, log, nome, exigir_exato=True,
 # compactada em cmed_*.csv.gz ao lado deste arquivo (colunas: substancia, produto, laboratorio,
 # apresentacao, ggrem, registro, classe, tipo, regime, pf_*, pmvg_*, pmc_*, restricao_hospitalar...).
 # A rota /cmed?q=<termo> devolve as apresentacoes que casam com as palavras do termo, para o no 05
-# do Processamento por o bloco <cmed> no prompt (fonte primaria de PF/PMVG/PMC, ICMS 18% = Ceara).
+# do Processamento por o bloco <cmed> no prompt (fonte primaria de PF/PMVG/PMC).
+# (14/11/2026 q) ICMS do Ceara = 20% desde 01/01/2024 (Lei estadual 18.305/2023). A lista passa a trazer as colunas
+# pf_20, pmvg_20 e pmc_20 (alem das 0% e 18% de antes) e pode ser atualizada direto do gov.br pela rota
+# POST /cmed/atualizar (ver _cmed_atualizar). Usa sempre o cmed_*.csv.gz mais novo (pela data no nome).
 # ─────────────────────────────────────────────
 _CMED = {"linhas": [], "arquivo": "", "publicada": "", "erro": ""}
 
@@ -2115,6 +2118,168 @@ def cmed_consulta():
         return jsonify({"publicada": _CMED["publicada"], "arquivo": _CMED["arquivo"], "total": len(_CMED["linhas"]), "erro": _CMED["erro"] or None})
     termos, linhas = _cmed_buscar(q, limite)
     return jsonify({"publicada": _CMED["publicada"], "arquivo": _CMED["arquivo"], "termos": termos, "encontrados": len(linhas), "linhas": linhas, "erro": _CMED["erro"] or None})
+
+
+# ─────────────────────────────────────────────
+# CMED - atualizacao automatica (14/11/2026 q, pedido do Italo)
+# POST /cmed/atualizar  [?forcar=1]
+#   1. le a pagina oficial da CMED no gov.br e acha os links lista_pmvg_AAAAMMDD_*.xlsx e lista_pmc_AAAAMMDD_*.xlsx;
+#   2. se ja existe cmed_AAAA-MM-DD.csv.gz ao lado deste arquivo, nao faz nada (so recarrega se a carregada for outra);
+#   3. baixa as duas planilhas, le em streaming (openpyxl read_only, ~170 MB de pico), junta PMVG e PMC pelo codigo GGREM
+#      e grava cmed_AAAA-MM-DD.csv.gz com as colunas de sempre + pf_20/pmvg_20/pmc_20; recarrega a lista do /cmed.
+# Somente fonte publica, nada do e-NatJus. Usa o _lock_ocr sem esperar (se houver OCR rodando, devolve 409 e o n8n tenta
+# depois) e recusa das 04:00 as 06:00 de dia util. Precisa de openpyxl no requirements.txt.
+# Observacao: o disco do Railway volta ao estado do repositorio a cada deploy/reinicio; por isso o n8n chama esta rota
+# toda semana (baixa de novo so se a lista do gov.br for mais nova que a carregada).
+# ─────────────────────────────────────────────
+_CMED_PAGINA = "https://www.gov.br/anvisa/pt-br/assuntos/medicamentos/cmed/precos"
+_CMED_RE_LINK = re.compile(r"/anvisa/pt-br/assuntos/medicamentos/cmed/precos/arquivos/(lista_(pmvg|pmc)_(\d{8})_\d+\.xlsx)", re.I)
+_CMED_BASE_COLS = {
+    "substancia": "SUBSTANCIA", "cnpj": "CNPJ", "laboratorio": "LABORATORIO", "ggrem": "CODIGO GGREM", "registro": "REGISTRO",
+    "ean1": "EAN 1", "produto": "PRODUTO", "apresentacao": "APRESENTACAO", "classe": "CLASSE TERAPEUTICA",
+    "tipo": "TIPO DE PRODUTO (STATUS DO PRODUTO)", "regime": "REGIME DE PRECO",
+    "restricao_hospitalar": "RESTRICAO HOSPITALAR", "cap": "CAP", "confaz87": "CONFAZ 87", "icms0": "ICMS 0%",
+    "analise_recursal": "ANALISE RECURSAL", "tarja": "TARJA",
+}
+_CMED_PRECOS_PMVG = {
+    "pf_sem_imp": "PF SEM IMPOSTOS", "pf_0": "PF 0%", "pf_18": "PF 18 %", "pf_18_alc": "PF 18 % ALC", "pf_20": "PF 20 %",
+    "pmvg_sem_imp": "PMVG SEM IMPOSTOS", "pmvg_0": "PMVG 0 %", "pmvg_18": "PMVG 18 %", "pmvg_18_alc": "PMVG 18 % ALC", "pmvg_20": "PMVG 20 %",
+}
+_CMED_PRECOS_PMC = {"pmc_0": "PMC 0 %", "pmc_18": "PMC 18 %", "pmc_18_alc": "PMC 18 % ALC", "pmc_20": "PMC 20 %"}
+_CMED_SAIDA = ["substancia", "produto", "laboratorio", "apresentacao", "registro", "ggrem", "ean1", "cnpj", "tipo", "classe", "regime",
+               "pf_sem_imp", "pf_0", "pf_18", "pf_18_alc", "pf_20", "pmvg_sem_imp", "pmvg_0", "pmvg_18", "pmvg_18_alc", "pmvg_20",
+               "pmc_0", "pmc_18", "pmc_18_alc", "pmc_20", "restricao_hospitalar", "cap", "confaz87", "icms0", "analise_recursal",
+               "comercializacao_2025", "tarja"]
+
+
+def _cmed_chave(s):
+    import unicodedata
+    s = unicodedata.normalize("NFD", str(s or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"\s+", " ", s).strip().upper()
+
+
+def _cmed_get(url, timeout=180):
+    req = urllib.request.Request(url, headers={"User-Agent": "AgNATJUS-TJCE/1.0 (Railway; NAT-JUS Ceara)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _cmed_links():
+    html_ = _cmed_get(_CMED_PAGINA, 60).decode("utf-8", "ignore")
+    links = {}
+    for m in _CMED_RE_LINK.finditer(html_):
+        links.setdefault(m.group(2).lower(), {"url": "https://www.gov.br" + m.group(0) + "/@@download/file", "data": m.group(3)})
+    return links
+
+
+def _cmed_planilha(conteudo, aba):
+    from openpyxl import load_workbook
+    wb = load_workbook(io.BytesIO(conteudo), read_only=True, data_only=True)
+    ws = None
+    for nome in wb.sheetnames:
+        if _cmed_chave(nome) == _cmed_chave(aba):
+            ws = wb[nome]
+    if ws is None:
+        ws = wb[wb.sheetnames[-1]]
+    linhas = ws.iter_rows(values_only=True)
+    for row in linhas:
+        if row and any(_cmed_chave(c) == "SUBSTANCIA" for c in row if c is not None):
+            return [_cmed_chave(c) for c in row], linhas
+    raise ValueError("cabecalho SUBSTANCIA nao encontrado na aba " + ws.title)
+
+
+def _cmed_txt(v):
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        return ("%.2f" % v).replace(".", ",")
+    return str(v).strip()
+
+
+def _cmed_montar(pmvg, pmc):
+    cab, linhas = _cmed_planilha(pmvg, "Lista PMVG")
+    idx = {c: i for i, c in enumerate(cab)}
+    col_com = next((c for c in cab if c.startswith("COMERCIALIZACAO")), None)
+    faltam = [v for v in list(_CMED_BASE_COLS.values()) + list(_CMED_PRECOS_PMVG.values()) if v not in idx]
+    if faltam:
+        raise ValueError("colunas ausentes na PMVG: " + ", ".join(faltam))
+    saida, ordem = {}, []
+    for row in linhas:
+        if not row or row[idx["SUBSTANCIA"]] in (None, ""):
+            continue
+        d = {k: _cmed_txt(row[idx[v]]) for k, v in _CMED_BASE_COLS.items()}
+        d.update({k: _cmed_txt(row[idx[v]]) for k, v in _CMED_PRECOS_PMVG.items()})
+        d["comercializacao_2025"] = _cmed_txt(row[idx[col_com]]) if col_com else ""
+        g = d["ggrem"] or (d["registro"] + "|" + d["apresentacao"])
+        if g not in saida:
+            ordem.append(g)
+        saida[g] = d
+    cab2, linhas2 = _cmed_planilha(pmc, "Lista PMC")
+    idx2 = {c: i for i, c in enumerate(cab2)}
+    faltam = [v for v in list(_CMED_PRECOS_PMC.values()) + ["CODIGO GGREM"] if v not in idx2]
+    if faltam:
+        raise ValueError("colunas ausentes na PMC: " + ", ".join(faltam))
+    n_pmc = 0
+    for row in linhas2:
+        if not row:
+            continue
+        g = _cmed_txt(row[idx2["CODIGO GGREM"]])
+        if g in saida:
+            for k, v in _CMED_PRECOS_PMC.items():
+                saida[g][k] = _cmed_txt(row[idx2[v]])
+            n_pmc += 1
+    return [saida[g] for g in ordem], n_pmc
+
+
+def _cmed_atualizar(forcar=False):
+    import csv, gzip
+    base = os.path.dirname(os.path.abspath(__file__))
+    links = _cmed_links()
+    if "pmvg" not in links or "pmc" not in links:
+        return {"novo": False, "erro": "links PMVG/PMC nao encontrados na pagina da CMED"}
+    data = links["pmvg"]["data"]
+    nome = "cmed_%s-%s-%s.csv.gz" % (data[:4], data[4:6], data[6:8])
+    caminho = os.path.join(base, nome)
+    if os.path.exists(caminho) and not forcar:
+        if _CMED.get("arquivo") != nome:
+            _CMED["linhas"] = []
+            _carregar_cmed()
+        return {"novo": False, "arquivo": _CMED.get("arquivo"), "publicada": _CMED.get("publicada"), "total": len(_CMED["linhas"])}
+    linhas, n_pmc = _cmed_montar(_cmed_get(links["pmvg"]["url"]), _cmed_get(links["pmc"]["url"]))
+    if len(linhas) < 10000:
+        return {"novo": False, "erro": "lista do gov.br com poucas linhas (%d); mantida a anterior" % len(linhas)}
+    tmp = caminho + ".tmp"
+    with gzip.open(tmp, "wt", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_CMED_SAIDA, extrasaction="ignore")
+        w.writeheader()
+        for d in linhas:
+            w.writerow({k: d.get(k, "") for k in _CMED_SAIDA})
+    os.replace(tmp, caminho)
+    del linhas
+    gc.collect()
+    _CMED["linhas"] = []
+    _carregar_cmed()
+    return {"novo": True, "arquivo": _CMED.get("arquivo"), "publicada": _CMED.get("publicada"), "total": len(_CMED["linhas"]), "com_pmc": n_pmc, "erro": _CMED.get("erro") or None}
+
+
+@app.route("/cmed/atualizar", methods=["POST"])
+def cmed_atualizar_rota():
+    import datetime
+    agora = datetime.datetime.utcnow() - datetime.timedelta(hours=3)  # Fortaleza (UTC-3, sem horario de verao)
+    if agora.weekday() < 5 and 4 <= agora.hour < 6:
+        return jsonify({"novo": False, "erro": "fora da janela: nada roda das 04:00 as 06:00 em dia util"}), 423
+    if not _lock_ocr.acquire(blocking=False):
+        return jsonify({"novo": False, "erro": "ocupado (OCR em andamento); tente mais tarde"}), 409
+    try:
+        forcar = str(request.args.get("forcar") or "").strip() in ("1", "true", "sim")
+        return jsonify(_cmed_atualizar(forcar)), 200
+    except ImportError:
+        return jsonify({"novo": False, "erro": "openpyxl nao instalado: acrescente openpyxl ao requirements.txt"}), 500
+    except Exception as e:
+        return jsonify({"novo": False, "erro": f"{type(e).__name__}: {str(e)[:200]}"}), 500
+    finally:
+        _lock_ocr.release()
+        gc.collect()
 
 
 def _abrir_tecnologia(pagina, tec, log):
