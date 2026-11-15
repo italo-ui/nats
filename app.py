@@ -611,7 +611,7 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-11-14q"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-11-14r"}), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -2050,7 +2050,11 @@ def _carregar_cmed():
         abrir = (lambda: gzip.open(arq, "rt", encoding="utf-8", newline="")) if arq.endswith(".gz") else (lambda: open(arq, "r", encoding="utf-8", newline=""))
         linhas = []
         with abrir() as f:
-            for r in csv.DictReader(f):
+            # (14/11/2026 r) aceita tambem CSV separado por ponto e virgula (arquivo aberto/salvo no Excel)
+            cab = f.readline()
+            f.seek(0)
+            sep = ";" if cab.count(";") > cab.count(",") else ","
+            for r in csv.DictReader(f, delimiter=sep):
                 r["_n"] = _cmed_norm(r.get("substancia", "")) + " | " + _cmed_norm(r.get("produto", ""))
                 linhas.append(r)
         _CMED["linhas"] = linhas
@@ -2122,7 +2126,7 @@ def cmed_consulta():
 
 # ─────────────────────────────────────────────
 # CMED - atualizacao automatica (14/11/2026 q, pedido do Italo)
-# POST /cmed/atualizar  [?forcar=1]
+# POST /cmed/atualizar  [?forcar=1]  (dispara em segundo plano; GET /cmed/atualizar mostra o resultado)
 #   1. le a pagina oficial da CMED no gov.br e acha os links lista_pmvg_AAAAMMDD_*.xlsx e lista_pmc_AAAAMMDD_*.xlsx;
 #   2. se ja existe cmed_AAAA-MM-DD.csv.gz ao lado deste arquivo, nao faz nada (so recarrega se a carregada for outra);
 #   3. baixa as duas planilhas, le em streaming (openpyxl read_only, ~170 MB de pico), junta PMVG e PMC pelo codigo GGREM
@@ -2262,24 +2266,43 @@ def _cmed_atualizar(forcar=False):
     return {"novo": True, "arquivo": _CMED.get("arquivo"), "publicada": _CMED.get("publicada"), "total": len(_CMED["linhas"]), "com_pmc": n_pmc, "erro": _CMED.get("erro") or None}
 
 
-@app.route("/cmed/atualizar", methods=["POST"])
-def cmed_atualizar_rota():
+# (14/11/2026 r) a atualizacao roda em SEGUNDO PLANO: baixar e ler as duas planilhas passa do tempo limite do worker
+# (o POST sincrono da versao q devolveu 502 aos ~35 s). O POST so dispara e devolve 202; o resultado fica em
+# GET /cmed/atualizar (estado da ultima atualizacao) e em GET /cmed sem q (arquivo e data da lista carregada).
+_CMED_ATUALIZACAO = {"rodando": False, "inicio": "", "fim": "", "resultado": None}
+
+
+def _cmed_atualizar_fundo(forcar):
     import datetime
-    agora = datetime.datetime.utcnow() - datetime.timedelta(hours=3)  # Fortaleza (UTC-3, sem horario de verao)
-    if agora.weekday() < 5 and 4 <= agora.hour < 6:
-        return jsonify({"novo": False, "erro": "fora da janela: nada roda das 04:00 as 06:00 em dia util"}), 423
-    if not _lock_ocr.acquire(blocking=False):
-        return jsonify({"novo": False, "erro": "ocupado (OCR em andamento); tente mais tarde"}), 409
     try:
-        forcar = str(request.args.get("forcar") or "").strip() in ("1", "true", "sim")
-        return jsonify(_cmed_atualizar(forcar)), 200
+        _CMED_ATUALIZACAO["resultado"] = _cmed_atualizar(forcar)
     except ImportError:
-        return jsonify({"novo": False, "erro": "openpyxl nao instalado: acrescente openpyxl ao requirements.txt"}), 500
+        _CMED_ATUALIZACAO["resultado"] = {"novo": False, "erro": "openpyxl nao instalado: acrescente openpyxl ao requirements.txt"}
     except Exception as e:
-        return jsonify({"novo": False, "erro": f"{type(e).__name__}: {str(e)[:200]}"}), 500
+        _CMED_ATUALIZACAO["resultado"] = {"novo": False, "erro": f"{type(e).__name__}: {str(e)[:200]}"}
     finally:
+        _CMED_ATUALIZACAO["rodando"] = False
+        _CMED_ATUALIZACAO["fim"] = datetime.datetime.utcnow().isoformat() + "Z"
         _lock_ocr.release()
         gc.collect()
+
+
+@app.route("/cmed/atualizar", methods=["GET", "POST"])
+def cmed_atualizar_rota():
+    import datetime
+    if request.method == "GET":
+        return jsonify(dict(_CMED_ATUALIZACAO, arquivo=_CMED.get("arquivo"), publicada=_CMED.get("publicada"), total=len(_CMED["linhas"]))), 200
+    agora = datetime.datetime.utcnow() - datetime.timedelta(hours=3)  # Fortaleza (UTC-3, sem horario de verao)
+    if agora.weekday() < 5 and 4 <= agora.hour < 6:
+        return jsonify({"iniciado": False, "erro": "fora da janela: nada roda das 04:00 as 06:00 em dia util"}), 423
+    if _CMED_ATUALIZACAO["rodando"]:
+        return jsonify({"iniciado": False, "erro": "atualizacao ja em andamento", "inicio": _CMED_ATUALIZACAO["inicio"]}), 409
+    if not _lock_ocr.acquire(blocking=False):
+        return jsonify({"iniciado": False, "erro": "ocupado (OCR em andamento); tente mais tarde"}), 409
+    forcar = str(request.args.get("forcar") or "").strip() in ("1", "true", "sim")
+    _CMED_ATUALIZACAO.update({"rodando": True, "inicio": datetime.datetime.utcnow().isoformat() + "Z", "fim": "", "resultado": None})
+    threading.Thread(target=_cmed_atualizar_fundo, args=(forcar,), daemon=True).start()
+    return jsonify({"iniciado": True, "inicio": _CMED_ATUALIZACAO["inicio"], "consulte": "GET /cmed/atualizar"}), 202
 
 
 def _abrir_tecnologia(pagina, tec, log):
