@@ -15,7 +15,7 @@ try:
 except Exception:
     pytesseract = None
     Image = None
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from playwright.sync_api import sync_playwright
 app = Flask(__name__)
 import threading, gc
@@ -41,15 +41,40 @@ _lock_ocr = threading.Lock()
 # chama o Railway — mesmo modelo ja usado para a chave do Gemini.
 # ============================================================
 NAT_API_KEY = os.environ.get("NAT_API_KEY", "").strip()
+VERSAO = "2026-11-16a"
 # (20/09/2026 n) a lista CMED e carregada na primeira consulta a /cmed (ver _carregar_cmed)
+
+
+_T_SUBIU = time.time()
+# (16/11/2026, pacote 9) Captura de tela so quando pedida: a tela do e-NatJus tem dado de paciente e a imagem ficava
+# guardada nas execucoes do n8n. Para pedir, mande captura=1 na URL ou "captura": true no corpo. A variavel
+# CAPTURA_PADRAO=1 (Railway > Variables) volta ao comportamento antigo (captura sempre).
+CAPTURA_PADRAO = os.environ.get("CAPTURA_PADRAO", "0").strip().lower() in ("1", "true", "sim")
+
+
+def _captura_pedida():
+    try:
+        v = request.args.get("captura")
+        if v is None:
+            corpo = request.get_json(silent=True)
+            v = corpo.get("captura") if isinstance(corpo, dict) else None
+        if v is None:
+            return CAPTURA_PADRAO
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("1", "true", "sim", "s", "yes")
+    except Exception:
+        return CAPTURA_PADRAO
 
 
 @app.before_request
 def _exigir_chave():
-    if request.path == "/" or request.method == "OPTIONS":
+    g.t0 = time.time()
+    if request.path in ("/", "/saude") or request.method == "OPTIONS":
         return None
     if not NAT_API_KEY:
-        return None
+        # (16/11/2026, pacote 9) sem a variavel NAT_API_KEY o servico ficava ABERTO a qualquer um. Agora recusa.
+        return jsonify({"erro": "servico sem chave configurada: defina NAT_API_KEY nas variaveis do Railway"}), 503
     enviada = (request.headers.get("X-Nat-Key") or "").strip()
     if not enviada:
         auth = request.headers.get("Authorization", "") or ""
@@ -58,6 +83,44 @@ def _exigir_chave():
     if not enviada or not hmac.compare_digest(enviada, NAT_API_KEY):
         return jsonify({"erro": "nao autorizado: header X-Nat-Key ausente ou invalido"}), 401
     return None
+
+
+def _segredos():
+    """Valores que nunca podem sair numa resposta (usuario e senha do e-NatJus, chave do servico)."""
+    out = []
+    for nome in ("ENATJUS_USER", "ENATJUS_PASS", "NAT_API_KEY"):
+        v = (os.environ.get(nome, "") or "").strip()
+        if len(v) >= 4:
+            out.append(v)
+            esc = json.dumps(v)[1:-1]
+            if esc != v:
+                out.append(esc)
+    return out
+
+
+@app.after_request
+def _limpar_e_registrar(resp):
+    # (16/11/2026, pacote 9) 1) nenhuma resposta leva usuario, senha ou chave, mesmo quando o erro do navegador os
+    # repete na mensagem; 2) uma linha de log por chamada (rota, status, tempo), sem corpo e sem dado de paciente.
+    try:
+        if resp.mimetype == "application/json" and not resp.direct_passthrough:
+            txt = resp.get_data(as_text=True)
+            mudou = False
+            for seg in _segredos():
+                if seg in txt:
+                    txt = txt.replace(seg, "[oculto]")
+                    mudou = True
+            if mudou:
+                resp.set_data(txt)
+    except Exception:
+        pass
+    try:
+        if request.path not in ("/", "/saude"):
+            ms = int((time.time() - getattr(g, "t0", time.time())) * 1000)
+            print(f"[rota] {request.method} {request.path} -> {resp.status_code} em {ms} ms", flush=True)
+    except Exception:
+        pass
+    return resp
 
 
 def _serializado(fn):
@@ -303,6 +366,8 @@ def _check_logged_in(page):
     except Exception:
         return False
 def _screenshot_b64(page):
+    if not _captura_pedida():
+        return None
     try:
         return base64.b64encode(page.screenshot(full_page=True)).decode()
     except Exception:
@@ -350,8 +415,22 @@ def _navegar_via_listagem(context, page, nt):
         if not _check_logged_in(page):
             raise Exception("Sessão expirada ou cookies inválidos")
     _renovar_sessao(context)  # TTL deslizante
-    linha = page.locator(f"tr:has-text('{nt}')").first
-    if linha.count() == 0:
+    # (16/11/2026, pacote 9) a linha tem de trazer o numero EXATO da NT numa celula. Antes valia a primeira linha que
+    # CONTIVESSE os digitos, e um numero de processo ou outra NT com os mesmos digitos abria a nota errada.
+    _alvo = re.sub(r"\D", "", str(nt))
+    _padrao = re.compile(r"(?<!\d)" + re.escape(_alvo) + r"(?!\d)")
+    _linhas = page.locator(f"tr:has-text('{nt}')")
+    linha = None
+    for _i in range(min(_linhas.count(), 40)):
+        _cand = _linhas.nth(_i)
+        try:
+            _cels = _cand.locator("td").all_inner_texts()
+        except Exception:
+            _cels = []
+        if any(_padrao.search(_c or "") for _c in _cels):
+            linha = _cand
+            break
+    if linha is None:
         raise Exception(f"NT {nt} não encontrada na listagem")
     btn_acoes = linha.locator("button, a").filter(has_text="Ações").first
     if btn_acoes.count() == 0:
@@ -484,6 +563,10 @@ def _navegar_ate_formulario(context, page, nt):
     advogado e do processo, e entao uma aba por tecnologia com o formulario inteiro dentro.
     """
     pagina = _navegar_ate_pagina_nt(context, page, nt)
+    # (16/11/2026, pacote 9) antes de preencher ou finalizar, confere se a pagina aberta e a da NT pedida.
+    _m = re.search(r"idNotaTecnica=(\d+)", pagina.url or "")
+    if _m and _m.group(1) != re.sub(r"\D", "", str(nt)):
+        raise Exception(f"A pagina aberta e da NT {_m.group(1)}, nao da NT {nt}. Nada foi gravado.")
     try:
         pagina.wait_for_selector("text=Diagnóstico Principal", timeout=20000)
     except Exception:
@@ -611,7 +694,34 @@ def _select_por_rotulo(pagina, rotulo, valor, log, nome):
 # ─────────────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": "2026-11-14r"}), 200
+    return jsonify({"ok": True, "chave_api": bool(NAT_API_KEY), "versao": VERSAO}), 200
+
+
+@app.route("/saude", methods=["GET"])
+def saude():
+    """(16/11/2026, pacote 9) Estado do servico SEM abrir navegador e sem chave: serve ao vigia do n8n."""
+    mem_mb = None
+    try:
+        with open("/proc/self/status") as f:
+            for linha in f:
+                if linha.startswith("VmRSS:"):
+                    mem_mb = round(int(linha.split()[1]) / 1024)
+                    break
+    except Exception:
+        pass
+    try:
+        cache_n = len([x for x in os.listdir(EXTRACAO_CACHE_DIR) if x.endswith(".json")])
+    except Exception:
+        cache_n = 0
+    return jsonify({
+        "ok": True, "versao": VERSAO, "chave_api": bool(NAT_API_KEY),
+        "no_ar_ha_s": int(time.time() - _T_SUBIU),
+        "navegador_ocupado": _lock_navegador.locked(), "ocr_ocupado": _lock_ocr.locked(),
+        "memoria_mb": mem_mb, "cmed_linhas": len(_CMED.get("linhas") or []),
+        "cmed_atualizando": bool(_CMED_ATUALIZACAO.get("rodando")),
+        "cache_extracoes": cache_n, "captura_padrao": CAPTURA_PADRAO,
+        "login_configurado": bool(ENATJUS_USER and ENATJUS_PASS),
+    }), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
 def teste():
@@ -824,6 +934,10 @@ def _cache_gravar(nt, payload):
         return
     if str((payload or {}).get("legibilidade", "")).lower() == "ilegivel":
         return  # deixa o retry tentar de novo
+    # (16/11/2026, pacote 9) leitura cortada por orcamento de tempo nao vai para o cache: guardada por 7 dias, a
+    # leitura seguinte voltava cortada igual. Sem cache, a proxima chamada le de novo, com o tempo inteiro.
+    if any("orcamento de tempo" in str(a) for a in ((payload or {}).get("avisos") or [])):
+        return
     try:
         os.makedirs(EXTRACAO_CACHE_DIR, exist_ok=True)
         with open(_cache_caminho(nt), "w") as f:
