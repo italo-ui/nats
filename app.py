@@ -2,6 +2,7 @@ import os, time, base64, json, subprocess, urllib.request, urllib.error, re
 import html
 import io
 import hmac, functools
+import contextlib, tempfile, shutil  # (17/11/2026, item 52) _com_prazo e anexos em disco no /processar
 try:
     import pymupdf as fitz  # PyMuPDF >= 1.24 (nome novo)
 except Exception:
@@ -16,8 +17,13 @@ except Exception:
     pytesseract = None
     Image = None
 from flask import Flask, request, jsonify, g
+from werkzeug.exceptions import RequestEntityTooLarge  # (17/11/2026, item 52)
 from playwright.sync_api import sync_playwright
 app = Flask(__name__)
+# (17/11/2026, item 52) teto do corpo das requisicoes (o /comprimir legado recebe PDF em base64 inteiro na memoria).
+# Padrao 100 MB (~ um PDF de 70 MB em base64). Acima disso o Flask recusa antes de ler: 413 com JSON {"erro": ...}.
+MAX_CORPO_MB = int(os.environ.get("MAX_CORPO_MB", "100"))
+app.config["MAX_CONTENT_LENGTH"] = MAX_CORPO_MB * 1048576
 import threading, gc
 _lock_navegador = threading.Lock()
 # LOCK DE OCR (16/09/2026). O _lock_navegador so cobre a navegacao; o download e o OCR do
@@ -41,7 +47,7 @@ _lock_ocr = threading.Lock()
 # chama o Railway — mesmo modelo ja usado para a chave do Gemini.
 # ============================================================
 NAT_API_KEY = os.environ.get("NAT_API_KEY", "").strip()
-VERSAO = "2026-11-16a"
+VERSAO = "2026-11-17a"
 # (20/09/2026 n) a lista CMED e carregada na primeira consulta a /cmed (ver _carregar_cmed)
 
 
@@ -123,22 +129,56 @@ def _limpar_e_registrar(resp):
     return resp
 
 
+class ServicoOcupado(Exception):
+    pass
+
+
+# (17/11/2026, item 52) Toda espera pela trava do navegador tem prazo. Antes /listar, /conclusao, /nt, /baixar e as
+# rotas com @_serializado esperavam sem limite: uma chamada presa segurava a fila inteira e as seguintes ficavam
+# penduradas (e ocupando memoria) ate o n8n desistir. Esgotado o prazo, a rota devolve 503
+# {"erro": "ocupado", "navegador_ocupado": true, ...}, que o n8n trata como falha transitoria.
+#   LOCK_ESPERA_S (Railway > Variables): segundos de espera pela trava (padrao 600).
+LOCK_ESPERA_S = int(os.environ.get("LOCK_ESPERA_S", "600"))
+
+
+@contextlib.contextmanager
+def _com_prazo(lock, nome="navegador", prazo=None):
+    """(17/11/2026, item 52) Igual a 'with lock:', mas com prazo de espera e release garantido em finally."""
+    prazo = LOCK_ESPERA_S if prazo is None else prazo
+    if not lock.acquire(timeout=max(1, prazo)):
+        raise ServicoOcupado(f"trava do {nome} ocupada por mais de {prazo}s")
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@app.errorhandler(ServicoOcupado)
+def _resp_ocupado(e):
+    # (17/11/2026, item 52) resposta unica para trava esgotada em qualquer rota
+    return jsonify({"erro": "ocupado", "detalhe": str(e), "navegador_ocupado": _lock_navegador.locked(),
+                    "ocr_ocupado": _lock_ocr.locked(), "espera_max_s": LOCK_ESPERA_S}), 503
+
+
+@app.errorhandler(413)
+def _resp_grande(e):
+    # (17/11/2026, item 52) corpo da requisicao acima de MAX_CORPO_MB: JSON em vez da pagina HTML do Flask
+    return jsonify({"erro": f"corpo da requisicao acima do teto de {MAX_CORPO_MB} MB (MAX_CORPO_MB)"}), 413
+
+
 def _serializado(fn):
     """Roda a rota inteira sob _lock_navegador: UM Chromium por vez em todo o servico.
 
     (18/09/2026) /preencher, /campos, /diagnostico, /login e /teste abriam o navegador fora
     da trava — a regra de sessao unica valia so para /processar, /listar, /conclusao e /nt.
     Dois Chromium ao lado de um OCR foi o que derrubou o servico por memoria em 16/09.
+    (17/11/2026, item 52) a espera agora tem prazo (LOCK_ESPERA_S); esgotado, 503 "ocupado".
     """
     @functools.wraps(fn)
     def _envolvida(*args, **kwargs):
-        with _lock_navegador:
+        with _com_prazo(_lock_navegador):
             return fn(*args, **kwargs)
     return _envolvida
-
-
-class ServicoOcupado(Exception):
-    pass
 
 
 def _adquirir(lock, t_inicio, orcamento, nome):
@@ -504,7 +544,10 @@ class ArquivoGrandeDemais(Exception):
     pass
 
 
-def _baixar_arquivo(hash_val, cookie_str, max_bytes=None):
+def _baixar_arquivo(hash_val, cookie_str, max_bytes=None, destino=None):
+    """(17/11/2026, item 52) destino: arquivo aberto em modo binario. Se vier, os blocos vao direto para o disco
+    (nada fica na memoria) e a funcao devolve (bytes_gravados, content_type) em vez de (conteudo, content_type).
+    max_bytes vale nos dois modos: acima do teto, ArquivoGrandeDemais sem carregar o resto."""
     url = DOWNLOAD_URL.format(hash=hash_val)
     req = urllib.request.Request(url)
     req.add_header("Cookie", cookie_str)
@@ -528,9 +571,28 @@ def _baixar_arquivo(hash_val, cookie_str, max_bytes=None):
                     break
                 lidos += len(bloco)
                 if lidos > max_bytes:
+                    partes = None  # (17/11/2026, item 52) solta o que ja tinha sido lido
                     raise ArquivoGrandeDemais(f"mais de {max_bytes // 1048576} MB")
-                partes.append(bloco)
+                if destino is not None:
+                    destino.write(bloco)  # (17/11/2026, item 52) direto para o disco
+                else:
+                    partes.append(bloco)
+            if destino is not None:
+                destino.flush()
+                return lidos, content_type
             conteudo = b"".join(partes)
+            partes = None
+        elif destino is not None:
+            # (17/11/2026, item 52) sem teto, mas ainda em disco
+            lidos = 0
+            while True:
+                bloco = resp.read(1048576)
+                if not bloco:
+                    break
+                lidos += len(bloco)
+                destino.write(bloco)
+            destino.flush()
+            return lidos, content_type
         else:
             conteudo = resp.read()
     return conteudo, content_type
@@ -701,12 +763,14 @@ def health():
 def saude():
     """(16/11/2026, pacote 9) Estado do servico SEM abrir navegador e sem chave: serve ao vigia do n8n."""
     mem_mb = None
+    mem_pico_mb = None  # (17/11/2026, item 52)
     try:
         with open("/proc/self/status") as f:
             for linha in f:
                 if linha.startswith("VmRSS:"):
                     mem_mb = round(int(linha.split()[1]) / 1024)
-                    break
+                elif linha.startswith("VmHWM:"):  # (17/11/2026, item 52) pico de memoria desde que subiu
+                    mem_pico_mb = round(int(linha.split()[1]) / 1024)
     except Exception:
         pass
     try:
@@ -721,6 +785,12 @@ def saude():
         "cmed_atualizando": bool(_CMED_ATUALIZACAO.get("rodando")),
         "cache_extracoes": cache_n, "captura_padrao": CAPTURA_PADRAO,
         "login_configurado": bool(ENATJUS_USER and ENATJUS_PASS),
+        # (17/11/2026, item 52) limites configurados e estado da CMED, para vigiar memoria
+        "memoria_pico_mb": mem_pico_mb,
+        "limites": {"max_arquivo_mb": MAX_ARQUIVO_MB, "max_corpo_mb": MAX_CORPO_MB, "lock_espera_s": LOCK_ESPERA_S,
+                    "ocr_pagina_timeout_s": OCR_PAGINA_TIMEOUT_S, "processar_orcamento_s": PROCESSAR_ORCAMENTO_S,
+                    "max_anexos": 5, "max_paginas_ocr": 40},
+        "cmed_arquivo": _CMED.get("arquivo"), "cmed_ultimo_erro_recarga": _CMED_ULTIMO_ERRO.get("erro") or None,
     }), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
@@ -828,7 +898,8 @@ def baixar():
         return jsonify({"erro": "numeroNT obrigatorio"}), 400
     pdfs  = []
     erros = []
-    with _lock_navegador:  # garante UM navegador por vez (evita estouro de memória)
+    grandes = 0  # (17/11/2026, item 52) anexos pulados por tamanho
+    with _com_prazo(_lock_navegador):  # garante UM navegador por vez (evita estouro de memória); (17/11/2026, item 52) com prazo
       with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context(accept_downloads=True)
@@ -850,7 +921,9 @@ def baixar():
             browser.close()
             for idx, info in enumerate(hashes_validos[:5]):
                 try:
-                    conteudo, content_type = _baixar_arquivo(info["hash"], cookies)
+                    # (17/11/2026, item 52) teto por arquivo (MAX_ARQUIVO_MB), como no /processar: acima dele o anexo
+                    # nao e carregado e entra em "avisos"; antes o /baixar lia qualquer tamanho para a memoria.
+                    conteudo, content_type = _baixar_arquivo(info["hash"], cookies, max_bytes=MAX_ARQUIVO_MB * 1048576)
                     nome = info.get("nome") or f"NT_{nt}_arquivo_{idx+1}.pdf"
                     pdfs.append({
                         "nome": nome,
@@ -858,6 +931,10 @@ def baixar():
                         "content_type": content_type,
                         "base64": base64.b64encode(conteudo).decode()
                     })
+                    conteudo = None  # (17/11/2026, item 52) so o base64 fica
+                except ArquivoGrandeDemais as e:
+                    grandes += 1
+                    erros.append(f"Arquivo {idx+1} (hash={info['hash'][:12]}...) ignorado: {e} (MAX_ARQUIVO_MB)")
                 except Exception as e:
                     erros.append(f"Arquivo {idx+1} (hash={info['hash'][:12]}...): {str(e)}")
         except Exception as e:
@@ -867,6 +944,9 @@ def baixar():
                 pass
             return jsonify({"erro": str(e), "avisos": erros}), 500
     if not pdfs:
+        if grandes and grandes == len(erros):
+            # (17/11/2026, item 52) todos os anexos acima do teto: 413 em vez de 500
+            return jsonify({"erro": f"todos os anexos acima do teto de {MAX_ARQUIVO_MB} MB", "detalhes": erros}), 413
         return jsonify({"erro": "Nenhum PDF baixado", "detalhes": erros}), 500
     return jsonify({
         "numeroNT": nt,
@@ -1005,7 +1085,18 @@ def _preprocess(img):
         return g.point(lambda p: 255 if p > thr else 0)
     except Exception:
         return g
-def _ocr_pagina(doc_fitz, indice, dpi=220):
+# (17/11/2026, item 52) tempo limite do Tesseract por pagina. Antes o OCR nao tinha limite: uma pagina travada
+# segurava o _lock_ocr (e a memoria da imagem) indefinidamente. Estourado, o pytesseract mata o processo do
+# tesseract e a pagina conta como ilegivel; o resto do texto ja extraido e devolvido normalmente, com aviso.
+#   OCR_PAGINA_TIMEOUT_S (Railway > Variables): segundos por pagina (padrao 60).
+OCR_PAGINA_TIMEOUT_S = int(os.environ.get("OCR_PAGINA_TIMEOUT_S", "60"))
+
+
+class OcrTempoEsgotado(Exception):
+    pass
+
+
+def _ocr_pagina(doc_fitz, indice, dpi=220, timeout=None):
     """Renderiza a pagina, pre-processa e roda OCR (portugues).
 
     MEMORIA (16/09/2026): antes renderizava em RGB a 300 dpi, codificava em PNG e decodificava
@@ -1023,7 +1114,14 @@ def _ocr_pagina(doc_fitz, indice, dpi=220):
         pix = None
     try:
         img = _preprocess(img)
-        return pytesseract.image_to_string(img, lang="por", config="--oem 1 --psm 6") or ""
+        # (17/11/2026, item 52) timeout: o pytesseract mata o tesseract e levanta RuntimeError("... timeout")
+        t = OCR_PAGINA_TIMEOUT_S if timeout is None else timeout
+        try:
+            return pytesseract.image_to_string(img, lang="por", config="--oem 1 --psm 6", timeout=max(1, int(t))) or ""
+        except RuntimeError as e:
+            if "timeout" in str(e).lower():
+                raise OcrTempoEsgotado(f"OCR passou de {int(t)}s")
+            raise
     finally:
         try:
             img.close()
@@ -1084,10 +1182,13 @@ def _extrair_paginas(conteudo, t_inicio, orcamento):
     mais leve que o pdfplumber, que levava minutos num processo de 500 paginas e segurava a fila.
     O pdfplumber fica como reserva quando o PyMuPDF nao esta disponivel ou falha no arquivo.
     Respeita o orcamento: para de extrair quando o tempo acabar e devolve o que leu."""
+    # (17/11/2026, item 52) 'conteudo' pode ser bytes ou o CAMINHO do anexo em disco (str): assim o /processar
+    # nao precisa manter os bytes do arquivo na memoria do Python.
+    em_disco = isinstance(conteudo, str)
     textos = []
     cortado = False
     if fitz is not None:
-        doc = fitz.open(stream=conteudo, filetype="pdf")
+        doc = fitz.open(conteudo, filetype="pdf") if em_disco else fitz.open(stream=conteudo, filetype="pdf")
         try:
             for i in range(doc.page_count):
                 if (time.time() - t_inicio) >= orcamento:
@@ -1102,7 +1203,7 @@ def _extrair_paginas(conteudo, t_inicio, orcamento):
         return textos, cortado
     import io
     import pdfplumber
-    with pdfplumber.open(io.BytesIO(conteudo)) as pdf:
+    with pdfplumber.open(conteudo if em_disco else io.BytesIO(conteudo)) as pdf:
         for pg in pdf.pages:
             if (time.time() - t_inicio) >= orcamento:
                 cortado = True
@@ -1115,11 +1216,21 @@ def _extrair_paginas(conteudo, t_inicio, orcamento):
     return textos, cortado
 
 
+def _apagar_silencioso(caminho):
+    """(17/11/2026, item 52) apaga o anexo temporario sem levantar erro."""
+    try:
+        if caminho and os.path.exists(caminho):
+            os.remove(caminho)
+    except Exception:
+        pass
+
+
 def _processar_nt(nt, t_inicio):
     try:
         _adquirir(_lock_navegador, t_inicio, PROCESSAR_ORCAMENTO_S, "navegador")
     except ServicoOcupado as e:
-        return jsonify({"erro": str(e), "numeroNT": nt}), 503
+        # (17/11/2026, item 52) mesmo erro de antes (o n8n ja trata), mais navegador_ocupado/ocr_ocupado
+        return jsonify({"erro": str(e), "numeroNT": nt, "navegador_ocupado": True, "ocr_ocupado": _lock_ocr.locked()}), 503
     try:
         with sync_playwright() as p:
             browser = _launch_browser(p)
@@ -1164,31 +1275,42 @@ def _processar_nt(nt, t_inicio):
     try:
         _adquirir(_lock_ocr, t_inicio, PROCESSAR_ORCAMENTO_S, "download/OCR")
     except ServicoOcupado as e:
-        return jsonify({"erro": str(e), "numeroNT": nt}), 503
+        # (17/11/2026, item 52) idem: campos de ocupacao
+        return jsonify({"erro": str(e), "numeroNT": nt, "navegador_ocupado": _lock_navegador.locked(), "ocr_ocupado": True}), 503
+    # (17/11/2026, item 52) UM anexo por vez na memoria. Antes os 5 anexos (ate 5 x MAX_ARQUIVO_MB = 300 MB) ficavam
+    # juntos na lista 'baixados' ate o fim. Agora cada download vai direto para um arquivo temporario em disco
+    # (sem passar pela memoria); depois, do menor para o maior (mesma ordem de antes, logo o mesmo resultado),
+    # cada anexo e aberto do disco, lido, fechado e apagado antes do proximo, com gc.collect() entre eles.
+    pasta_tmp = None
     try:
-      # 1) baixa o conteudo de cada arquivo
-      baixados = []
+      pasta_tmp = tempfile.mkdtemp(prefix="nat_anexos_")
+      # 1) baixa cada arquivo para o disco
+      baixados = []  # (idx, caminho, tamanho) — so metadados, nada de bytes
       for idx, info in enumerate(hashes_validos[:5]):
         if (time.time() - t_inicio) >= OCR_TIME_BUDGET:
             avisos.append(f"Arquivo {idx+1} nao foi baixado: orcamento de tempo esgotado.")
             texto_total += f"\n[arquivo {idx+1} nao baixado: orcamento de tempo esgotado]\n"
             continue
+        caminho = os.path.join(pasta_tmp, f"anexo_{idx+1}.pdf")
         try:
-            conteudo, _ct = _baixar_arquivo(info["hash"], cookies, max_bytes=MAX_ARQUIVO_MB * 1048576)
-            baixados.append((idx, conteudo))
+            with open(caminho, "wb") as f_dest:
+                tamanho, _ct = _baixar_arquivo(info["hash"], cookies, max_bytes=MAX_ARQUIVO_MB * 1048576, destino=f_dest)
+            baixados.append((idx, caminho, tamanho))
         except ArquivoGrandeDemais as e:
+            _apagar_silencioso(caminho)
             avisos.append(f"Arquivo {idx+1} ignorado: {e}.")
             texto_total += f"\n[arquivo {idx+1} ignorado: {e} — leitura manual necessaria]\n"
         except Exception as e:
+            _apagar_silencioso(caminho)
             texto_total += f"\n[erro ao baixar arquivo {idx+1}: {e}]\n"
       # 2) menor -> maior (gasta o orcamento de OCR nos arquivos menores primeiro)
-      baixados.sort(key=lambda x: len(x[1]))
-      # Consome a lista tirando cada arquivo dela: o conteudo ja processado e liberado
-      # antes de abrir o proximo, em vez de ficar tudo em memoria ate o fim.
+      baixados.sort(key=lambda x: x[2])
       while baixados:
-        idx, conteudo = baixados.pop(0)
+        idx, caminho, _tam = baixados.pop(0)
+        textos = None
+        doc_fitz = None
         try:
-            textos, cortado = _extrair_paginas(conteudo, t_inicio, OCR_TIME_BUDGET)
+            textos, cortado = _extrair_paginas(caminho, t_inicio, OCR_TIME_BUDGET)
             if not textos:
                 # nenhuma pagina lida (orcamento ja esgotado ou PDF vazio): nao conta como arquivo lido
                 avisos.append(f"Arquivo {idx+1} nao foi lido: orcamento de tempo esgotado antes da primeira pagina.")
@@ -1196,18 +1318,26 @@ def _processar_nt(nt, t_inicio):
                 continue
             if cortado:
                 avisos.append(f"Arquivo {idx+1}: leitura interrompida na pagina {len(textos)} por orcamento de tempo.")
-            doc_fitz = None
             for i, txt_pagina in enumerate(textos):
                 paginas_total += 1
                 if _texto_ruim(txt_pagina):
                     txt_ocr = ""
                     dentro_orcamento = (paginas_ocr < MAX_PAGINAS_OCR) and ((time.time() - t_inicio) < OCR_TIME_BUDGET)
                     if dentro_orcamento and fitz is not None:
+                        # (17/11/2026, item 52) prazo da pagina: o menor entre OCR_PAGINA_TIMEOUT_S e o que resta do orcamento
+                        restante = OCR_TIME_BUDGET - (time.time() - t_inicio)
+                        prazo_pg = max(1, min(OCR_PAGINA_TIMEOUT_S, int(restante)))
                         try:
                             if doc_fitz is None:
-                                doc_fitz = fitz.open(stream=conteudo, filetype="pdf")
-                            txt_ocr = _ocr_pagina(doc_fitz, i)
+                                doc_fitz = fitz.open(caminho, filetype="pdf")
+                            txt_ocr = _ocr_pagina(doc_fitz, i, timeout=prazo_pg)
                             paginas_ocr += 1
+                        except OcrTempoEsgotado as e:
+                            # (17/11/2026, item 52) pagina pulada; o resto segue. Cortada pelo orcamento -> o aviso
+                            # cita "orcamento de tempo" e a extracao nao vai para o cache (ver _cache_gravar).
+                            motivo = "orcamento de tempo" if prazo_pg < OCR_PAGINA_TIMEOUT_S else f"tempo limite de OCR ({OCR_PAGINA_TIMEOUT_S}s)"
+                            avisos.append(f"Arquivo {idx+1}, pagina {i+1}: OCR interrompido por {motivo}.")
+                            txt_ocr = ""
                         except Exception:
                             txt_ocr = ""
                     if _texto_ruim(txt_ocr):
@@ -1217,19 +1347,24 @@ def _processar_nt(nt, t_inicio):
                         texto_total += txt_ocr + "\n"
                 else:
                     texto_total += txt_pagina + "\n"
-            if doc_fitz is not None:
-                doc_fitz.close()
             texto_total += "\n--- fim do documento ---\n\n"
             arquivos += 1
         except Exception as e:
             texto_total += f"\n[erro ao ler arquivo: {e}]\n"
         finally:
-            conteudo = None
+            if doc_fitz is not None:
+                try:
+                    doc_fitz.close()
+                except Exception:
+                    pass
             textos = None
             doc_fitz = None
+            _apagar_silencioso(caminho)  # (17/11/2026, item 52) anexo lido sai do disco antes do proximo
             gc.collect()
     finally:
         _lock_ocr.release()
+        if pasta_tmp:  # (17/11/2026, item 52) nada de anexo fica no disco, nem em erro
+            shutil.rmtree(pasta_tmp, ignore_errors=True)
     texto_total = texto_total.strip()
     if arquivos == 0 and anexos_total > 0:
         # 19/09/2026: nenhum anexo lido (orcamento esgotado, download falhou ou arquivo acima do teto).
@@ -1361,7 +1496,7 @@ def listar():
     if porpagina not in ("10", "25", "50", "100"):
         porpagina = "100"
 
-    with _lock_navegador:
+    with _com_prazo(_lock_navegador):  # (17/11/2026, item 52) espera com prazo
         with sync_playwright() as p:
             browser = _launch_browser(p)
             context = browser.new_context()
@@ -1489,7 +1624,7 @@ def conclusao(nt):
     Devolve a conclusao registrada na NT: Favoravel / Nao favoravel.
     Usado pelo NATJUS1 apenas para as NTs recem-detectadas como emitidas.
     """
-    with _lock_navegador:
+    with _com_prazo(_lock_navegador):  # (17/11/2026, item 52) espera com prazo
         with sync_playwright() as p:
             browser = _launch_browser(p)
             context = browser.new_context()
@@ -1628,7 +1763,7 @@ def nt_completa(nt):
     usar onError continueRegularOutput, como o no 12 do NATJUS1 ja faz com /conclusao.
     """
     quer_captura = request.args.get("captura") == "1"
-    with _lock_navegador:
+    with _com_prazo(_lock_navegador):  # (17/11/2026, item 52) espera com prazo
         with sync_playwright() as p:
             browser = _launch_browser(p)
             context = browser.new_context()
@@ -2150,32 +2285,67 @@ def _cmed_norm(t):
     return _norm_txt(str(t or ""))
 
 
-def _carregar_cmed():
+# (17/11/2026, item 52) TROCA ATOMICA da lista CMED (~70 MB). Antes a recarga zerava _CMED["linhas"] e so depois lia o
+# arquivo: por alguns segundos o /cmed devolvia 0 linhas (e um erro de leitura deixava a lista vazia ate o proximo
+# deploy). Agora a lista nova e montada numa variavel separada e, pronta, a referencia global _CMED e trocada de uma
+# vez sob uma trava curta. Se a leitura falhar, a lista anterior continua no ar. Custo: durante a recarga as duas
+# listas coexistem por alguns segundos (pico de ~+70 MB).
+_cmed_troca_lock = threading.Lock()   # protege so a troca da referencia (instantanea)
+_cmed_carga_lock = threading.Lock()   # uma recarga por vez (duas leituras paralelas dobrariam a memoria)
+_CMED_ULTIMO_ERRO = {"erro": "", "quando": 0}
+
+
+def _cmed_ler_arquivo():
+    """(17/11/2026, item 52) Le o cmed_*.csv(.gz) mais novo e devolve um dict NOVO no formato de _CMED. Nao toca no global."""
     import csv, glob, gzip
+    base = os.path.dirname(os.path.abspath(__file__))
+    arqs = sorted(glob.glob(os.path.join(base, "cmed_*.csv.gz")) + glob.glob(os.path.join(base, "cmed_*.csv")))
+    if not arqs:
+        raise FileNotFoundError("arquivo cmed_*.csv(.gz) nao encontrado ao lado do app.py")
+    arq = arqs[-1]
+    m = re.search(r"cmed_(\d{4})-(\d{2})-(\d{2})", os.path.basename(arq))
+    publicada = f"{m.group(3)}/{m.group(2)}/{m.group(1)}" if m else ""
+    abrir = (lambda: gzip.open(arq, "rt", encoding="utf-8", newline="")) if arq.endswith(".gz") else (lambda: open(arq, "r", encoding="utf-8", newline=""))
+    linhas = []
+    with abrir() as f:
+        # (14/11/2026 r) aceita tambem CSV separado por ponto e virgula (arquivo aberto/salvo no Excel)
+        cab = f.readline()
+        f.seek(0)
+        sep = ";" if cab.count(";") > cab.count(",") else ","
+        for r in csv.DictReader(f, delimiter=sep):
+            r["_n"] = _cmed_norm(r.get("substancia", "")) + " | " + _cmed_norm(r.get("produto", ""))
+            linhas.append(r)
+    return {"linhas": linhas, "arquivo": os.path.basename(arq), "publicada": publicada, "erro": ""}
+
+
+def _carregar_cmed(espera_s=120, so_se_vazia=False):
+    """(17/11/2026, item 52) Recarrega com troca atomica. Devolve None (ok) ou o texto do erro.
+    Em erro: se ja havia lista, ela fica; se nao havia, _CMED["erro"] e preenchido (como antes)."""
+    global _CMED
+    if not _cmed_carga_lock.acquire(timeout=espera_s):
+        return "recarga da CMED ja em andamento"
     try:
-        base = os.path.dirname(os.path.abspath(__file__))
-        arqs = sorted(glob.glob(os.path.join(base, "cmed_*.csv.gz")) + glob.glob(os.path.join(base, "cmed_*.csv")))
-        if not arqs:
-            _CMED["erro"] = "arquivo cmed_*.csv(.gz) nao encontrado ao lado do app.py"
-            return
-        arq = arqs[-1]
-        m = re.search(r"cmed_(\d{4})-(\d{2})-(\d{2})", os.path.basename(arq))
-        _CMED["publicada"] = f"{m.group(3)}/{m.group(2)}/{m.group(1)}" if m else ""
-        abrir = (lambda: gzip.open(arq, "rt", encoding="utf-8", newline="")) if arq.endswith(".gz") else (lambda: open(arq, "r", encoding="utf-8", newline=""))
-        linhas = []
-        with abrir() as f:
-            # (14/11/2026 r) aceita tambem CSV separado por ponto e virgula (arquivo aberto/salvo no Excel)
-            cab = f.readline()
-            f.seek(0)
-            sep = ";" if cab.count(";") > cab.count(",") else ","
-            for r in csv.DictReader(f, delimiter=sep):
-                r["_n"] = _cmed_norm(r.get("substancia", "")) + " | " + _cmed_norm(r.get("produto", ""))
-                linhas.append(r)
-        _CMED["linhas"] = linhas
-        _CMED["arquivo"] = os.path.basename(arq)
-        _CMED["erro"] = ""
-    except Exception as e:
-        _CMED["erro"] = f"{type(e).__name__}: {str(e)[:160]}"
+        if so_se_vazia and _CMED.get("linhas"):
+            return None  # outra chamada acabou de carregar enquanto esta esperava
+        try:
+            novo = _cmed_ler_arquivo()
+        except Exception as e:
+            msg = f"{type(e).__name__}: {str(e)[:160]}"
+            _CMED_ULTIMO_ERRO.update({"erro": msg, "quando": int(time.time())})
+            if not _CMED.get("linhas"):
+                with _cmed_troca_lock:
+                    _CMED = dict(_CMED, erro=msg)
+            return msg
+        with _cmed_troca_lock:
+            antigo = _CMED
+            _CMED = novo
+        _CMED_ULTIMO_ERRO.update({"erro": "", "quando": int(time.time())})
+        antigo = None  # a lista anterior sai da memoria quando a ultima busca em curso terminar
+        novo = None
+        gc.collect()
+        return None
+    finally:
+        _cmed_carga_lock.release()
 
 
 _CMED_STOP = set("""mg mcg ml g ui comprimido comprimidos capsula capsulas frasco frascos ampola ampolas solucao injetavel oral uso continuo
@@ -2196,10 +2366,11 @@ def _cmed_termos(q):
 
 def _cmed_buscar(q, limite=60):
     termos = _cmed_termos(q)
-    if not termos or not _CMED["linhas"]:
+    linhas_cmed = _CMED["linhas"]  # (17/11/2026, item 52) uma referencia so: a troca atomica nao afeta esta busca
+    if not termos or not linhas_cmed:
         return termos, []
     achados = []
-    for r in _CMED["linhas"]:
+    for r in linhas_cmed:
         n = r["_n"]
         hits = [t for t in termos if t in n]
         if hits:
@@ -2226,16 +2397,20 @@ def cmed_consulta():
     (20/09/2026 o) a chave e conferida pelo before_request (X-Nat-Key), como nas demais rotas; a
     conferencia extra por x-api-key que existia aqui devolvia 401 ao n8n."""
     if not _CMED["linhas"] and not _CMED["erro"]:
-        _carregar_cmed()
+        _carregar_cmed(so_se_vazia=True)
+        if not _CMED["linhas"] and not _CMED["erro"]:
+            # (17/11/2026, item 52) outra chamada esta carregando e nao terminou no prazo: falha transitoria
+            return jsonify({"erro": "ocupado", "detalhe": "lista CMED sendo carregada; tente de novo"}), 503
+    c = _CMED  # (17/11/2026, item 52) instantaneo coerente (arquivo/publicada/linhas da mesma lista)
     q = str(request.args.get("q") or "").strip()
     try:
         limite = max(1, min(120, int(request.args.get("limite") or 60)))
     except Exception:
         limite = 60
     if not q:
-        return jsonify({"publicada": _CMED["publicada"], "arquivo": _CMED["arquivo"], "total": len(_CMED["linhas"]), "erro": _CMED["erro"] or None})
+        return jsonify({"publicada": c["publicada"], "arquivo": c["arquivo"], "total": len(c["linhas"]), "erro": c["erro"] or None})
     termos, linhas = _cmed_buscar(q, limite)
-    return jsonify({"publicada": _CMED["publicada"], "arquivo": _CMED["arquivo"], "termos": termos, "encontrados": len(linhas), "linhas": linhas, "erro": _CMED["erro"] or None})
+    return jsonify({"publicada": c["publicada"], "arquivo": c["arquivo"], "termos": termos, "encontrados": len(linhas), "linhas": linhas, "erro": c["erro"] or None})
 
 
 # ─────────────────────────────────────────────
@@ -2359,10 +2534,14 @@ def _cmed_atualizar(forcar=False):
     nome = "cmed_%s-%s-%s.csv.gz" % (data[:4], data[4:6], data[6:8])
     caminho = os.path.join(base, nome)
     if os.path.exists(caminho) and not forcar:
+        erro_carga = None
         if _CMED.get("arquivo") != nome:
-            _CMED["linhas"] = []
-            _carregar_cmed()
-        return {"novo": False, "arquivo": _CMED.get("arquivo"), "publicada": _CMED.get("publicada"), "total": len(_CMED["linhas"])}
+            erro_carga = _carregar_cmed()  # (17/11/2026, item 52) sem zerar a lista antes: troca atomica
+        c = _CMED
+        r = {"novo": False, "arquivo": c.get("arquivo"), "publicada": c.get("publicada"), "total": len(c["linhas"])}
+        if erro_carga:
+            r["erro"] = "recarga falhou, mantida a lista anterior: " + erro_carga
+        return r
     linhas, n_pmc = _cmed_montar(_cmed_get(links["pmvg"]["url"]), _cmed_get(links["pmc"]["url"]))
     if len(linhas) < 10000:
         return {"novo": False, "erro": "lista do gov.br com poucas linhas (%d); mantida a anterior" % len(linhas)}
@@ -2375,9 +2554,10 @@ def _cmed_atualizar(forcar=False):
     os.replace(tmp, caminho)
     del linhas
     gc.collect()
-    _CMED["linhas"] = []
-    _carregar_cmed()
-    return {"novo": True, "arquivo": _CMED.get("arquivo"), "publicada": _CMED.get("publicada"), "total": len(_CMED["linhas"]), "com_pmc": n_pmc, "erro": _CMED.get("erro") or None}
+    erro_carga = _carregar_cmed()  # (17/11/2026, item 52) sem zerar a lista antes: troca atomica; falhou, fica a anterior
+    c = _CMED
+    return {"novo": True, "arquivo": c.get("arquivo"), "publicada": c.get("publicada"), "total": len(c["linhas"]), "com_pmc": n_pmc,
+            "erro": (("recarga falhou, mantida a lista anterior: " + erro_carga) if erro_carga else (c.get("erro") or None))}
 
 
 # (14/11/2026 r) a atualizacao roda em SEGUNDO PLANO: baixar e ler as duas planilhas passa do tempo limite do worker
@@ -3184,6 +3364,9 @@ def comprimir():
             "caracteres": len(texto),
             "paginas":    total_paginas
         })
+    except RequestEntityTooLarge:
+        # (17/11/2026, item 52) corpo acima de MAX_CORPO_MB: 413 JSON (ver _resp_grande), e nao 500
+        return _resp_grande(None)
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
 if __name__ == "__main__":
