@@ -47,7 +47,7 @@ _lock_ocr = threading.Lock()
 # chama o Railway — mesmo modelo ja usado para a chave do Gemini.
 # ============================================================
 NAT_API_KEY = os.environ.get("NAT_API_KEY", "").strip()
-VERSAO = "2026-11-17a"
+VERSAO = "2026-11-23a"
 # (20/09/2026 n) a lista CMED e carregada na primeira consulta a /cmed (ver _carregar_cmed)
 
 
@@ -94,7 +94,7 @@ def _exigir_chave():
 def _segredos():
     """Valores que nunca podem sair numa resposta (usuario e senha do e-NatJus, chave do servico)."""
     out = []
-    for nome in ("ENATJUS_USER", "ENATJUS_PASS", "NAT_API_KEY"):
+    for nome in ("ENATJUS_USER", "ENATJUS_PASS", "NAT_API_KEY", "PDPJ_USER", "PDPJ_PASS"):
         v = (os.environ.get(nome, "") or "").strip()
         if len(v) >= 4:
             out.append(v)
@@ -3369,6 +3369,243 @@ def comprimir():
         return _resp_grande(None)
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
+
+# ============================================================
+# EVIDENCIAJUD (CNJ) — consulta pelo login da PDPJ (23/11/2026, pedido do Ítalo)
+# ------------------------------------------------------------
+# Duas ferramentas do CNJ, com o mesmo login da PDPJ (CPF e senha do e-NatJus):
+#   EvidênciaJud             https://evidenciajud.cloud.dnxbrasil.com.br  (chat com IA: e-NatJus nacional + CONITEC + ANVISA)
+#   EvidênciaJud-Literatura  https://evidencialit.cloud.dnxbrasil.com.br  (pares medicamento x CID ja prontos: pareceres + PubMed)
+# Nao ha chave de API: o acesso e a sessao do navegador depois do login unico da PDPJ (Keycloak do CNJ),
+# que expira em horas. Este bloco entra com o Playwright UMA vez, guarda os cookies e faz as consultas
+# com requests (sem navegador). Se a sessao cair (redirecionamento ou 401/403), reloga uma vez e repete.
+# Riscos aceitos pelo Ítalo (23/11/2026): e um robo usando a conta dele; o ambiente parece ser de
+# desenvolvimento ("rag-usp-dev"); o CNJ pode bloquear ou o site mudar sem aviso. Nunca contornar
+# CAPTCHA, segundo fator ou bloqueio: se aparecer, a rota devolve erro claro e para.
+# Variaveis: PDPJ_USER / PDPJ_PASS (se nao existirem, usa ENATJUS_USER / ENATJUS_PASS).
+# Nao mandar nome de paciente, CPF nem numero de processo nas perguntas (e um sistema de terceiros).
+# ============================================================
+import requests as _rq
+import unicodedata as _ud
+
+EVID_JUD = "https://evidenciajud.cloud.dnxbrasil.com.br"
+EVID_LIT = "https://evidencialit.cloud.dnxbrasil.com.br"
+PDPJ_USER = (os.environ.get("PDPJ_USER") or ENATJUS_USER or "").strip()
+PDPJ_PASS = (os.environ.get("PDPJ_PASS") or ENATJUS_PASS or "")
+EVID_TIMEOUT_S = int(os.environ.get("EVID_TIMEOUT_S", "150"))
+_evid_lock = threading.Lock()            # um login por vez
+_EVID = {"cookies": {}, "login_em": {}, "pares": None, "pares_em": 0, "ultimo_erro": None}
+_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+
+def _evid_login(base):
+    """Entra na ferramenta 'base' pelo SSO da PDPJ com o Playwright e guarda os cookies dela."""
+    if not (PDPJ_USER and PDPJ_PASS):
+        raise Exception("login da PDPJ indisponivel: defina PDPJ_USER/PDPJ_PASS (ou ENATJUS_USER/ENATJUS_PASS)")
+    with _com_prazo(_lock_navegador):
+        with sync_playwright() as p:
+            browser = _launch_browser(p)
+            try:
+                context = browser.new_context(user_agent=_UA)
+                page = context.new_page()
+                page.goto(base + "/", timeout=60000)
+                page.wait_for_load_state("networkidle", timeout=45000)
+                if "sso.cloud.pje.jus.br" in page.url:
+                    # tela do Keycloak do CNJ ("CPF/CNPJ" e "Senha")
+                    usuario = page.locator("input[name='username'], #username, input[type='text'], input[type='tel']").first
+                    senha = page.locator("input[name='password'], #password, input[type='password']").first
+                    usuario.fill(PDPJ_USER, timeout=20000)
+                    senha.fill(PDPJ_PASS, timeout=20000)
+                    try:
+                        page.locator("#kc-login, button[type='submit'], input[type='submit']").first.click(timeout=15000)
+                    except Exception:
+                        senha.press("Enter")
+                    try:
+                        page.wait_for_url(base + "/**", timeout=60000)
+                    except Exception:
+                        pass
+                    page.wait_for_load_state("networkidle", timeout=45000)
+                if not page.url.startswith(base):
+                    txt = ""
+                    try:
+                        txt = page.inner_text("body")[:400]
+                    except Exception:
+                        pass
+                    low = txt.lower()
+                    if "captcha" in low or "código" in low or "codigo" in low or "verifica" in low:
+                        raise Exception("a PDPJ pediu verificacao extra (CAPTCHA ou codigo); o robo nao contorna isso")
+                    if "inválid" in low or "invalid" in low or "incorret" in low:
+                        raise Exception("a PDPJ recusou usuario ou senha")
+                    raise Exception("login da PDPJ nao voltou para a ferramenta (pagina: " + page.url.split("?")[0] + ")")
+                ck = {c["name"]: c["value"] for c in context.cookies() if base.split("//")[1].endswith(c["domain"].lstrip("."))}
+                if not ck:
+                    raise Exception("login feito mas sem cookie da ferramenta")
+                _EVID["cookies"][base] = ck
+                _EVID["login_em"][base] = time.time()
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+
+def _evid_sessao(base, forcar=False):
+    with _evid_lock:
+        if forcar or not _EVID["cookies"].get(base):
+            _evid_login(base)
+        s = _rq.Session()
+        s.headers.update({"User-Agent": _UA, "Accept": "application/json, text/plain, */*"})
+        for k, v in _EVID["cookies"][base].items():
+            s.cookies.set(k, v, domain=base.split("//")[1])
+        return s
+
+
+def _evid_expirou(r):
+    if r.status_code in (301, 302, 303, 307, 308, 401, 403):
+        return True
+    ct = (r.headers.get("content-type") or "").lower()
+    return "text/html" in ct and "sso.cloud.pje.jus.br" in (r.text[:5000] if r.text else "")
+
+
+def _evid_req(base, metodo, caminho, **kw):
+    """Faz a chamada com a sessao guardada; se expirou, reloga uma vez e repete."""
+    kw.setdefault("timeout", EVID_TIMEOUT_S)
+    kw.setdefault("allow_redirects", False)
+    for tentativa in (0, 1):
+        s = _evid_sessao(base, forcar=(tentativa == 1))
+        r = s.request(metodo, base + caminho, **kw)
+        if not _evid_expirou(r):
+            return r
+    raise Exception(f"sessao da ferramenta recusada mesmo depois de relogar (HTTP {r.status_code})")
+
+
+def _norm(t):
+    t = _ud.normalize("NFKD", str(t or "")).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9. ]", " ", t)).strip()
+
+
+@app.route("/evidencia/saude", methods=["GET"])
+def evidencia_saude():
+    """Estado do login e datas das bases (nao abre navegador se ja houver sessao)."""
+    out = {"ok": True, "login_configurado": bool(PDPJ_USER and PDPJ_PASS),
+           "sessao": {b.split("//")[1].split(".")[0]: (int(time.time() - t) if t else None) for b, t in _EVID["login_em"].items()},
+           "ultimo_erro": _EVID.get("ultimo_erro")}
+    if request.args.get("testar") == "1":
+        try:
+            r = _evid_req(EVID_JUD, "GET", "/cutoffdates", timeout=30)
+            out["bases_evidenciajud"] = r.json() if r.ok else {"http": r.status_code}
+        except Exception as e:
+            out["ok"] = False
+            out["erro"] = str(e)[:300]
+    return jsonify(out), (200 if out["ok"] else 502)
+
+
+@app.route("/evidencia/pergunta", methods=["POST"])
+def evidencia_pergunta():
+    """
+    Pergunta ao EvidênciaJud (chat). Corpo JSON: {"pergunta": "...", "sessao": "opcional"}.
+    Devolve {"ok", "texto", "interaction_id", "ms", "bases"}. Cada chamada usa uma sessao nova
+    do chat (sem historico entre perguntas), a menos que "sessao" seja informada.
+    NAO envie nome de paciente, CPF nem numero de processo.
+    """
+    corpo = request.get_json(silent=True) or {}
+    pergunta = str(corpo.get("pergunta") or "").strip()
+    if not pergunta:
+        return jsonify({"ok": False, "erro": "informe 'pergunta'"}), 400
+    if len(pergunta) > 1000:
+        return jsonify({"ok": False, "erro": "a ferramenta aceita ate 1000 caracteres"}), 400
+    sessao = str(corpo.get("sessao") or "").strip() or ("session_agnatjus_" + str(int(time.time() * 1000)))
+    t0 = time.time()
+    try:
+        r = _evid_req(EVID_JUD, "POST", "/query_stream", json={"question": pergunta},
+                      headers={"Content-Type": "application/json", "X-Session-ID": sessao}, stream=False)
+        if not r.ok:
+            raise Exception(f"EvidenciaJud respondeu HTTP {r.status_code}")
+        texto, meta = [], {}
+        for linha in r.text.splitlines():
+            linha = linha.strip()
+            if not linha:
+                continue
+            try:
+                c = json.loads(linha)
+            except Exception:
+                continue
+            if c.get("node") == "meta":
+                meta = c.get("content") or {}
+                continue
+            if c.get("node") == "julgamento":
+                continue
+            cont = c.get("content")
+            if isinstance(cont, str):
+                texto.append(cont)
+            elif isinstance(cont, list):
+                texto.extend(b.get("text", "") for b in cont if isinstance(b, dict) and b.get("type") == "text")
+        bases = None
+        try:
+            rb = _evid_req(EVID_JUD, "GET", "/cutoffdates", timeout=20)
+            bases = rb.json() if rb.ok else None
+        except Exception:
+            pass
+        _EVID["ultimo_erro"] = None
+        return jsonify({"ok": True, "texto": "".join(texto).strip(), "interaction_id": meta.get("interaction_id"),
+                        "sessao": sessao, "bases": bases, "ms": int((time.time() - t0) * 1000),
+                        "fonte": "EvidênciaJud (CNJ) — " + EVID_JUD}), 200
+    except ServicoOcupado:
+        raise
+    except Exception as e:
+        _EVID["ultimo_erro"] = str(e)[:300]
+        return jsonify({"ok": False, "erro": str(e)[:300]}), 502
+
+
+def _evid_pares():
+    if _EVID["pares"] is None or time.time() - _EVID["pares_em"] > 6 * 3600:
+        r = _evid_req(EVID_LIT, "GET", "/literatura/pares", timeout=60)
+        if not r.ok:
+            raise Exception(f"EvidênciaJud-Literatura respondeu HTTP {r.status_code}")
+        _EVID["pares"] = r.json()
+        _EVID["pares_em"] = time.time()
+    return _EVID["pares"]
+
+
+@app.route("/evidencia/literatura", methods=["GET"])
+def evidencia_literatura():
+    """
+    Resumo pronto do EvidênciaJud-Literatura para um medicamento e um CID.
+    ?medicamento=dupilumabe&cid=L20.9   (cid opcional; casa pelo codigo de 3 caracteres)
+    ?listar=1 devolve so a lista de pares que casam (sem o detalhe).
+    """
+    med = _norm(request.args.get("medicamento"))
+    cid = _norm(request.args.get("cid")).replace(".", "").replace(" ", "")[:3]
+    if not med:
+        return jsonify({"ok": False, "erro": "informe 'medicamento'"}), 400
+    try:
+        dados = _evid_pares()
+        pares = dados.get("pares") or []
+        cands = []
+        for p in pares:
+            nm = _norm(p.get("medicamento"))
+            if not nm or not (med in nm or nm in med):
+                continue
+            cc = _norm(p.get("cid_codigo")).replace(".", "")[:3]
+            if cid and cc != cid:
+                continue
+            cands.append(p)
+        cands.sort(key=lambda p: (-(1 if _norm(p.get("medicamento")) == med else 0), -(p.get("n_notas") or 0)))
+        resumo = [{k: p.get(k) for k in ("_id", "medicamento", "CID", "n_notas", "n_f", "n_n", "pubmed_atualizado_em")} for p in cands[:20]]
+        out = {"ok": True, "encontrados": len(cands), "pares": resumo, "meta": {k: (dados.get("meta") or {}).get(k) for k in ("gerado_em", "pubmed_atualizado_em", "n_pares", "modelo")},
+               "fonte": "EvidênciaJud-Literatura (CNJ) — " + EVID_LIT}
+        if cands and request.args.get("listar") != "1":
+            r = _evid_req(EVID_LIT, "GET", "/literatura/pares/" + cands[0]["_id"], timeout=60)
+            out["par"] = r.json() if r.ok else {"http": r.status_code}
+        _EVID["ultimo_erro"] = None
+        return jsonify(out), 200
+    except ServicoOcupado:
+        raise
+    except Exception as e:
+        _EVID["ultimo_erro"] = str(e)[:300]
+        return jsonify({"ok": False, "erro": str(e)[:300]}), 502
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
