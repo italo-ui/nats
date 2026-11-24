@@ -47,7 +47,7 @@ _lock_ocr = threading.Lock()
 # chama o Railway — mesmo modelo ja usado para a chave do Gemini.
 # ============================================================
 NAT_API_KEY = os.environ.get("NAT_API_KEY", "").strip()
-VERSAO = "2026-11-23a"
+VERSAO = "2026-11-23b"  # (23/11/2026 b) nova rota GET /conitec/decisao (texto da portaria decisória no gov.br)
 # (20/09/2026 n) a lista CMED e carregada na primeira consulta a /cmed (ver _carregar_cmed)
 
 
@@ -791,6 +791,7 @@ def saude():
                     "ocr_pagina_timeout_s": OCR_PAGINA_TIMEOUT_S, "processar_orcamento_s": PROCESSAR_ORCAMENTO_S,
                     "max_anexos": 5, "max_paginas_ocr": 40},
         "cmed_arquivo": _CMED.get("arquivo"), "cmed_ultimo_erro_recarga": _CMED_ULTIMO_ERRO.get("erro") or None,
+        "conitec_cache": len(_CONITEC_CACHE),  # (23/11/2026 b)
     }), 200
 @app.route("/teste", methods=["GET"])
 @_serializado
@@ -3606,6 +3607,476 @@ def evidencia_literatura():
         return jsonify({"ok": False, "erro": str(e)[:300]}), 502
 
 
+# ============================================================
+# CONITEC — DECISÃO OFICIAL (texto da portaria) A PARTIR DO RELATÓRIO (23/11/2026, aprovado pelo Ítalo às 21:42)
+# ------------------------------------------------------------
+# Por quê: no teste real da NT 608163 (teriparatida, M81.0) o EvidênciaJud leu o TÍTULO do Relatório nº 921
+# ("... osteoporose secundária a glicocorticoides, pacientes do sexo masculino e pacientes com IAM/AVC ...")
+# como se fosse a lista do que foi excluído; a Portaria SECTICS/MS nº 39, de 19/09/2024, Art. 1º, excluiu a
+# teriparatida para a osteoporose grave inteira. O EvidênciaJud acha os documentos certos, mas pode errar o que a
+# decisão diz. Esta rota lê a decisão NA FONTE (gov.br/conitec), só com requests (sem Playwright, sem login).
+#
+# GET /conitec/decisao?relatorio=921                      (número do relatório; aceita 1.102 ou 1102)
+#     &url=<link gov.br/conitec do relatório>            (opcional; página do relatório ou o próprio PDF)
+#     &portaria=<pista: "SCTIE/MS nº 33, de 12 de junho de 2026"> (opcional; só usada se o PDF não trouxer a portaria)
+#     &tecnologia=<nome>                                  (opcional; só para conferir a pista)
+#     &atualizar=1                                        (ignora o cache)
+# Resposta (sempre HTTP 200, nunca exceção para o chamador):
+#   {ok, relatorio:{numero, url, pdf, titulo, numero_confere}, portaria:{titulo, orgao, numero, data, data_br,
+#    url, pdf, ementa, art1, decisoes:[{art, texto}], tipo}, vinculo, fonte, avisos, cache, ms}   ou {ok:false, erro, ...}
+#   vinculo: "relatorio_pdf"  = a portaria está transcrita no próprio relatório (seção DECISÃO) — o mais seguro;
+#            "indice_conitec" = o número da portaria veio da planilha oficial "Painel de recomendações" da CONITEC;
+#            "pista"          = o número veio do texto do chamador (EvidênciaJud) e foi conferido na página da portaria.
+#   tipo: incorporacao | nao_incorporacao | exclusao | ampliacao | restricao | pcdt | outro
+# Como acha a portaria:
+#   1) PDF do relatório: da url informada (página -> link @@display-file/file) ou, só com o número, pela planilha
+#      oficial do Painel de recomendações (link lido da página "recomendacoes-conitec"); o texto do PDF é lido com o
+#      PyMuPDF e o bloco "PORTARIA ... Nº X, DE dd DE mês DE aaaa" + "Torna pública a decisão de ..." + "Art. 1º" é
+#      extraído (relatórios finais trazem a portaria na seção DECISÃO, ex.: 921, 920, 742).
+#   2) Sem a portaria no PDF (ex.: 1102, publicado antes da portaria): número e data vindos da planilha ou da pista
+#      -> página https://www.gov.br/conitec/pt-br/midias/relatorios/portaria/AAAA/portaria-<orgao>-ms-no-N-de-D-de-MES-de-AAAA
+#      -> PDF da portaria -> ementa e Art. 1º.
+# Só busca em www.gov.br/conitec (nenhum outro endereço). Timeout curto por chamada e prazo total ~25 s.
+# Cache em memória: 7 dias para acerto, 1 hora para falha.
+# ============================================================
+import zipfile as _zip
+from xml.etree import ElementTree as _ET
+
+CONITEC_BASE = "https://www.gov.br/conitec/pt-br"
+CONITEC_PRAZO_S = float(os.environ.get("CONITEC_PRAZO_S", "25"))
+_CONITEC_CACHE = {}          # chave -> (expira_em, resposta)
+_CONITEC_INDICE = {"em": 0, "linhas": None, "url": None, "erro": None}
+_CONITEC_OK_S = 7 * 86400
+_CONITEC_FALHA_S = 3600
+_MESES = ["janeiro", "fevereiro", "marco", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro",
+          "novembro", "dezembro"]
+
+
+def _cn_sem_acento(s):
+    return _ud.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode()
+
+
+def _cn_url_ok(u):
+    """Só www.gov.br/conitec (evita a rota virar um proxy aberto)."""
+    u = str(u or "").strip()
+    return bool(re.match(r"^https://www\.gov\.br/conitec/", u))
+
+
+class _CnPrazo(Exception):
+    pass
+
+
+def _cn_get(url, prazo_fim, binario=False, maximo=25 * 1048576):
+    if not _cn_url_ok(url):
+        raise Exception("endereço fora de www.gov.br/conitec: " + str(url)[:120])
+    resta = prazo_fim - time.time()
+    if resta < 2:
+        raise _CnPrazo("prazo da consulta esgotado")
+    r = _rq.get(url, timeout=(5, max(2, min(15, resta))), headers={"User-Agent": _UA, "Accept": "*/*"},
+                allow_redirects=True, stream=True)
+    if not _cn_url_ok(r.url):
+        raise Exception("redirecionado para fora da CONITEC")
+    if r.status_code != 200:
+        raise Exception(f"gov.br respondeu HTTP {r.status_code} em {url.split('/pt-br/')[-1][:90]}")
+    corpo = b""
+    for parte in r.iter_content(262144):
+        corpo += parte
+        if len(corpo) > maximo:
+            raise Exception("arquivo grande demais")
+        if time.time() > prazo_fim:
+            raise _CnPrazo("prazo da consulta esgotado no download")
+    if binario:
+        return corpo, r.url, (r.headers.get("content-type") or "")
+    return corpo.decode(r.encoding or "utf-8", "replace"), r.url, (r.headers.get("content-type") or "")
+
+
+def _cn_limpa(s):
+    s = str(s or "").replace(chr(173), "")
+    s = re.sub(r"(?<=[a-záéíóúâêôãõç])-\n(?=[a-záéíóúâêôãõç])", "", s)   # palavra quebrada no fim da linha
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _cn_pdf_texto(dados):
+    if fitz is None:
+        raise Exception("PyMuPDF indisponível no servidor")
+    doc = fitz.open(stream=dados, filetype="pdf")
+    try:
+        paginas = [doc[i].get_text("text") or "" for i in range(len(doc))]
+    finally:
+        doc.close()
+    return paginas
+
+
+_RX_PORT = re.compile(
+    r"PORTARIA\s+(?:CONJUNTA\s+)?(?:(?P<orgao>[A-ZÇ]{2,10}(?:\s*/\s*[A-ZÇ]{2,10})*?)\s*[/\-–]\s*MS\s+)?"
+    r"N\s*[º°o\.]?\s*(?P<num>\d{1,4}(?:\.\d{3})?)\s*,?\s+DE\s+(?P<dia>\d{1,2})\s*[º°o]?\s+DE\s+(?P<mes>[A-ZÇa-zç]+)"
+    r"\s+DE\s+(?P<ano>\d{4})", re.I)
+_RX_VERBO = re.compile(r"^(N[ãa]o\s+incorporar|Incorporar|Excluir|Desincorporar|Ampliar|Restringir|Manter|"
+                       r"Aprovar|Atualizar|Alterar|Tornar\s+p[úu]blica)", re.I)
+
+
+def _cn_tipo(texto):
+    s = _cn_sem_acento(texto).lower().strip()
+    if s.startswith("nao incorporar"):
+        return "nao_incorporacao"
+    if s.startswith("incorporar"):
+        return "incorporacao"
+    if s.startswith("excluir") or s.startswith("desincorporar"):
+        return "exclusao"
+    if s.startswith("ampliar"):
+        return "ampliacao"
+    if s.startswith("restringir"):
+        return "restricao"
+    if s.startswith("aprovar") or s.startswith("atualizar") or "protocolo" in s[:80] or "diretriz" in s[:80]:
+        return "pcdt"
+    return "outro"
+
+
+def _cn_extrai_portarias(texto):
+    """Acha no texto (PDF do relatório, da portaria ou do relatório para a sociedade) os blocos de portaria
+    decisória: cabeçalho + 'Torna pública' (ou artigo decisório logo abaixo). Devolve lista de dicts."""
+    t = _cn_limpa(texto)
+    achados = []
+    for m in _RX_PORT.finditer(t):
+        janela = t[m.end(): m.end() + 6000]
+        mt = re.search(r"Torna\s+p[úu]blica", janela[:900], re.I)
+        ma1 = re.search(r"Art\.?\s*1\s*[º°o]?\s*\.?\s*[-–]?\s*", janela[:4000])
+        if not mt:
+            # sem "Torna pública": só vale se o Art. 1º vier logo abaixo e começar com verbo decisório
+            if not ma1 or ma1.start() > 1500 or not _RX_VERBO.match(janela[ma1.end():ma1.end() + 40]):
+                continue
+        ementa = ""
+        if mt:
+            fim_e = len(janela)
+            for marca in (r"Ref\.?\s*:", r"\bO\s+SECRET[ÁA]RI", r"\bA\s+SECRET[ÁA]RI", r"\bO\(A\)\s+SECRET",
+                          r"\bO\s+MINISTR", r"\bA\s+MINISTR", r"\bresolve\b", r"Art\.?\s*1\s*[º°o]"):
+                mm = re.search(marca, janela[mt.start():], re.I)
+                if mm:
+                    fim_e = min(fim_e, mt.start() + mm.start())
+            ementa = janela[mt.start():fim_e].strip(" .;") + "."
+        decisoes = []
+        if ma1:
+            corpo = janela[ma1.start():]
+            corte = re.search(r"Esta\s+Portaria\s+entra\s+em\s+vigor|PORTARIA\s+[A-Z]{2,10}\s*/\s*MS\s+N", corpo[10:])
+            if corte:
+                corpo = corpo[:10 + corte.start()]
+            partes = re.split(r"(Art\.?\s*\d+\s*[º°o]?\s*\.?\s*[-–]?\s*)", corpo)
+            # partes: ['', 'Art. 1º ', 'texto', 'Art. 2º ', 'texto', ...]
+            for i in range(1, len(partes) - 1, 2):
+                n = re.search(r"\d+", partes[i]).group(0)
+                tx = partes[i + 1].strip(" ;")
+                # assinatura (nome em maiúsculas no fim) não faz parte do artigo
+                tx = re.sub(r"\s+(?:[A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ\.]+\s+){1,5}[A-ZÁÉÍÓÚÂÊÔÃÕÇ\.]{2,}\s*$", "", tx)
+                if n == "1" or _RX_VERBO.match(tx):
+                    decisoes.append({"art": n, "texto": tx[:1500]})
+                if len(decisoes) >= 6:
+                    break
+        if not ementa and not decisoes:
+            continue
+        mes = _cn_sem_acento(m.group("mes")).lower()
+        mesn = (_MESES.index(mes) + 1) if mes in _MESES else None
+        num = m.group("num").replace(".", "")
+        orgao = re.sub(r"\s+", "", m.group("orgao") or "")
+        art1 = next((d["texto"] for d in decisoes if d["art"] == "1"), "")
+        achados.append({
+            "titulo": ("PORTARIA " + (orgao + "/MS " if orgao else "") + "Nº " + num + ", DE " + m.group("dia")
+                       + " DE " + m.group("mes").upper() + " DE " + m.group("ano")),
+            "orgao": (orgao + "/MS") if orgao else None, "numero": num, "ano": m.group("ano"),
+            "data": (f"{m.group('ano')}-{mesn:02d}-{int(m.group('dia')):02d}" if mesn else None),
+            "data_br": (f"{int(m.group('dia')):02d}/{mesn:02d}/{m.group('ano')}" if mesn else None),
+            "ementa": ementa[:2000], "art1": art1, "decisoes": decisoes,
+            "tipo": _cn_tipo(art1 or re.sub(r"^Torna\s+p[úu]blica\s+a\s+decis[ãa]o\s+de\s+", "", ementa, flags=re.I)),
+            "_mes_nome": mes, "_dia": int(m.group("dia")), "_pos": m.start(),
+        })
+    return achados
+
+
+def _cn_palavras(s):
+    s = _cn_sem_acento(s).lower()
+    fora = {"para", "tratamento", "pacientes", "com", "sus", "sistema", "unico", "saude", "ambito", "decisao", "torna",
+            "publica", "relatorio", "recomendacao", "medicamento", "uso", "dos", "das", "que", "aos", "nas", "nos",
+            "incorporar", "excluir", "ampliar", "nao", "conforme", "protocolo", "clinico", "ministerio"}
+    return {w for w in re.findall(r"[a-z]{4,}", s) if w not in fora}
+
+
+def _cn_escolhe(achados, titulo_rel):
+    if not achados:
+        return None
+    if len(achados) == 1 or not titulo_rel:
+        return achados[-1]
+    alvo = _cn_palavras(titulo_rel)
+    return max(achados, key=lambda a: (len(alvo & _cn_palavras(a["ementa"] + " " + a["art1"])), a["_pos"]))
+
+
+def _cn_num_rx(numero):
+    n = str(int(numero))
+    if len(n) > 3:
+        n = n[:-3] + r"\.?" + n[-3:]
+    return n
+
+
+def _cn_indice(prazo_fim, avisos):
+    """Planilha oficial 'Painel de recomendações' (link na página recomendacoes-conitec). Leitura tolerante:
+    procura a linha cujo campo de número do relatório bate. Cache 24 h. NÃO testada contra o arquivo real
+    (o container de desenvolvimento não acessa o gov.br): se o formato não bater, a rota segue sem ela."""
+    if _CONITEC_INDICE["linhas"] is not None and time.time() - _CONITEC_INDICE["em"] < 86400:
+        return _CONITEC_INDICE["linhas"]
+    try:
+        pag, _, _ = _cn_get(CONITEC_BASE + "/assuntos/avaliacao-de-tecnologias-em-saude/recomendacoes-conitec", prazo_fim)
+        m = re.search(r'href="([^"]*recomendacoesdaconitec[^"]*?\.xlsx[^"]*)"', pag, re.I)
+        if not m:
+            raise Exception("link da planilha do Painel de recomendações não encontrado")
+        u = html.unescape(m.group(1))
+        if u.startswith("/"):
+            u = "https://www.gov.br" + u
+        dados, _, _ = _cn_get(u, prazo_fim, binario=True)
+        z = _zip.ZipFile(io.BytesIO(dados))
+        ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        rns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        comp = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            for si in _ET.fromstring(z.read("xl/sharedStrings.xml")).findall("m:si", ns):
+                comp.append("".join(x.text or "" for x in si.iter("{%s}t" % ns["m"])))
+        folhas = sorted(n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
+        linhas = []
+        for f in folhas[:3]:
+            raiz = _ET.fromstring(z.read(f))
+            links = {}
+            relf = f.replace("worksheets/", "worksheets/_rels/") + ".rels"
+            alvos = {}
+            if relf in z.namelist():
+                for rel in _ET.fromstring(z.read(relf)):
+                    alvos[rel.get("Id")] = rel.get("Target")
+            for h in raiz.iter("{%s}hyperlink" % ns["m"]):
+                if h.get(rns) in alvos:
+                    links[h.get("ref")] = alvos[h.get(rns)]
+            cab = None
+            for row in raiz.iter("{%s}row" % ns["m"]):
+                vals = {}
+                for c in row.findall("m:c", ns):
+                    ref = c.get("r") or ""
+                    col = re.sub(r"\d", "", ref)
+                    v = c.find("m:v", ns)
+                    tx = c.find("m:is", ns)
+                    if c.get("t") == "s" and v is not None:
+                        val = comp[int(v.text)] if v.text and v.text.isdigit() and int(v.text) < len(comp) else ""
+                    elif tx is not None:
+                        val = "".join(x.text or "" for x in tx.iter("{%s}t" % ns["m"]))
+                    else:
+                        val = v.text if v is not None else ""
+                    vals[col] = (str(val or "").strip(), links.get(ref))
+                if cab is None:
+                    textos = " ".join(_cn_sem_acento(x[0]).lower() for x in vals.values())
+                    if "relat" in textos and ("portaria" in textos or "decis" in textos or "tecnolog" in textos):
+                        cab = {col: _cn_sem_acento(x[0]).lower() for col, x in vals.items()}
+                    continue
+                linhas.append({"campos": {cab.get(col, col): x[0] for col, x in vals.items()},
+                               "links": [x[1] for x in vals.values() if x[1]]})
+        _CONITEC_INDICE.update({"em": time.time(), "linhas": linhas, "url": u, "erro": None})
+        return linhas
+    except _CnPrazo:
+        raise
+    except Exception as e:
+        _CONITEC_INDICE.update({"em": time.time(), "linhas": [], "erro": str(e)[:200]})
+        avisos.append("planilha do Painel de recomendações indisponível: " + str(e)[:160])
+        return []
+
+
+def _cn_linha_indice(numero, prazo_fim, avisos):
+    rx = re.compile(r"(?<!\d)" + _cn_num_rx(numero) + r"(?!\d)")
+    for ln in _cn_indice(prazo_fim, avisos):
+        for k, v in ln["campos"].items():
+            if "relat" in k and rx.search(v or ""):
+                return ln
+    return None
+
+
+def _cn_slugs_portaria(orgao, numero, dia, mes_nome, ano):
+    org = [o for o in ([re.sub(r"[^a-z]", "", _cn_sem_acento(orgao).lower().split("/ms")[0])] if orgao else []) if o]
+    for o in ("sectics", "sctie"):
+        if o not in org:
+            org.append(o)
+    dias = [str(dia)] + (["1o", "01"] if int(dia) == 1 else [])
+    out = []
+    for o in org:
+        for d in dias:
+            out.append(f"{CONITEC_BASE}/midias/relatorios/portaria/{ano}/portaria-{o}-ms-no-{numero}-de-{d}-de-{mes_nome}-de-{ano}")
+    return out[:6]
+
+
+def _cn_portaria_pela_pagina(orgao, numero, dia, mes_nome, ano, prazo_fim, avisos):
+    for u in _cn_slugs_portaria(orgao, numero, dia, mes_nome, ano):
+        try:
+            pag, final, ct = _cn_get(u, prazo_fim)
+        except _CnPrazo:
+            raise
+        except Exception:
+            continue
+        m = re.search(r'href="([^"]*@@(?:display-file|download)/file[^"]*)"', pag)
+        pdf_u = html.unescape(m.group(1)) if m else None
+        if pdf_u and pdf_u.startswith("/"):
+            pdf_u = "https://www.gov.br" + pdf_u
+        if not pdf_u:
+            avisos.append("página da portaria sem o PDF: " + u)
+            continue
+        dados, _, _ = _cn_get(pdf_u, prazo_fim, binario=True)
+        ach = _cn_extrai_portarias("\n".join(_cn_pdf_texto(dados)))
+        ach = [a for a in ach if a["numero"] == str(numero)] or ach
+        if ach:
+            a = ach[0]
+            a["url"], a["pdf"] = final, pdf_u
+            return a
+        avisos.append("PDF da portaria sem texto legível (pode ser imagem): " + pdf_u)
+    return None
+
+
+def _cn_pista(s):
+    """'Portaria SCTIE/MS nº 33, de 12 de junho de 2026' -> (orgao, numero, dia, mes, ano)."""
+    s = _cn_sem_acento(s).upper()
+    m = re.search(r"([A-Z]{2,10})\s*[/\-]\s*MS\s*N\s*[O\.]?\s*(\d{1,4}(?:\.\d{3})?)\s*,?\s*DE\s+(\d{1,2})\s*O?\s+DE\s+([A-Z]+)\s+DE\s+(\d{4})", s)
+    if not m:
+        return None
+    mes = m.group(4).lower()
+    if mes not in _MESES:
+        return None
+    return (m.group(1) + "/MS", m.group(2).replace(".", ""), int(m.group(3)), mes, m.group(5))
+
+
+def _cn_resolver(numero, url, pista, tecnologia):
+    prazo_fim = time.time() + CONITEC_PRAZO_S
+    avisos = []
+    out = {"ok": False, "relatorio": {"numero": numero, "url": None, "pdf": None, "titulo": None, "numero_confere": None},
+           "portaria": None, "vinculo": None, "avisos": avisos}
+    linha = None
+    rel_url = url if _cn_url_ok(url) else None
+    if url and not rel_url:
+        avisos.append("url ignorada (só www.gov.br/conitec)")
+    if not rel_url and numero:
+        linha = _cn_linha_indice(numero, prazo_fim, avisos)
+        if linha:
+            rel_url = next((l for l in linha["links"] if _cn_url_ok(l) and "/relatorios/" in l and "/portaria/" not in l), None)
+    pdf_u, titulo, paginas = None, None, None
+    if rel_url:
+        out["relatorio"]["url"] = rel_url
+        if re.search(r"@@(display-file|download)/file|\.pdf$", rel_url, re.I):
+            pdf_u = rel_url
+        else:
+            pag, final, ct = _cn_get(rel_url, prazo_fim)
+            out["relatorio"]["url"] = final
+            mt = re.search(r'<meta\s+name="description"\s+content="([^"]*)"', pag) or re.search(r"<title>([^<]*)</title>", pag)
+            titulo = html.unescape(mt.group(1)).strip() if mt else None
+            m = re.search(r'href="([^"]*@@(?:display-file|download)/file[^"]*)"', pag)
+            if m:
+                pdf_u = html.unescape(m.group(1))
+                if pdf_u.startswith("/"):
+                    pdf_u = "https://www.gov.br" + pdf_u
+        if pdf_u:
+            dados, _, _ = _cn_get(pdf_u, prazo_fim, binario=True)
+            paginas = _cn_pdf_texto(dados)
+            out["relatorio"]["pdf"] = pdf_u
+    capa = _cn_limpa(" ".join((paginas or [])[:3]))
+    if not titulo and capa:
+        titulo = capa[:300]
+    out["relatorio"]["titulo"] = (titulo or "")[:400] or None
+    if numero and capa:
+        out["relatorio"]["numero_confere"] = bool(re.search(r"N\s*[º°o\.]?\s*" + _cn_num_rx(numero) + r"(?!\d)", capa, re.I))
+        if not out["relatorio"]["numero_confere"]:
+            avisos.append("o número do relatório não aparece na capa do PDF: confira se o link é do relatório certo")
+    port = None
+    if paginas:
+        port = _cn_escolhe(_cn_extrai_portarias("\n".join(paginas)), titulo or tecnologia)
+        if port:
+            out["vinculo"] = "relatorio_pdf"
+            port["url"], port["pdf"] = None, pdf_u
+            try:   # página própria da portaria, só para dar o link (não muda o texto)
+                pp = _cn_portaria_pela_pagina(port["orgao"], port["numero"], port["_dia"], port["_mes_nome"], port["ano"], prazo_fim, [])
+                if pp:
+                    port["url"], port["pdf"] = pp["url"], pp["pdf"]
+            except Exception:
+                pass
+    if not port:
+        cand = None
+        if linha is None and numero:
+            try:
+                linha = _cn_linha_indice(numero, prazo_fim, avisos)
+            except _CnPrazo:
+                linha = None
+        if linha:
+            for v in linha["campos"].values():
+                cand = _cn_pista(v)
+                if cand:
+                    out["vinculo"] = "indice_conitec"
+                    break
+        if not cand and pista:
+            cand = _cn_pista(pista)
+            if cand:
+                out["vinculo"] = "pista"
+        if cand:
+            port = _cn_portaria_pela_pagina(*cand, prazo_fim, avisos)
+            if port and out["vinculo"] == "pista":
+                # a pista vem de texto de terceiros: só vale se a portaria citar a tecnologia do relatório e não for
+                # anterior ao relatório (a portaria decisória sai depois do relatório, no mesmo ano ou no seguinte)
+                alvo = _cn_palavras((titulo or "") + " " + (tecnologia or ""))
+                ano_rel = None
+                mr = re.search(r"/relatorios/(?:consultas/)?(20\d\d)/", out["relatorio"].get("url") or "") or \
+                    re.search(r"\b(?:de|DE)\s+(20\d\d)\b", capa[:400])
+                if mr:
+                    ano_rel = int(mr.group(1))
+                if alvo and not (alvo & _cn_palavras(port["ementa"] + " " + port["art1"])):
+                    avisos.append("a portaria da pista não cita a tecnologia do relatório: descartada")
+                    port = None
+                elif ano_rel and not (ano_rel <= int(port["ano"]) <= ano_rel + 1):
+                    avisos.append("a portaria da pista é de " + port["ano"] + " e o relatório de " + str(ano_rel) + ": descartada")
+                    port = None
+    if not port:
+        out["erro"] = ("portaria decisória não encontrada" + (" no relatório" if paginas else "")
+                       + ("" if rel_url else " (relatório não localizado: informe a url do gov.br)"))
+        return out
+    for k in [k for k in port if k.startswith("_")]:
+        port.pop(k, None)
+    out["ok"] = True
+    out["portaria"] = port
+    out["fonte"] = ("gov.br/conitec — texto da " + port["titulo"].title().replace("Ms", "MS").replace("Sectics", "SECTICS").replace("Sctie", "SCTIE")
+                    + (" transcrito no Relatório de Recomendação" if out["vinculo"] == "relatorio_pdf" else " (PDF da portaria)"))
+    return out
+
+
+@app.route("/conitec/decisao", methods=["GET"])
+def conitec_decisao():
+    t0 = time.time()
+    numero = re.sub(r"\D", "", request.args.get("relatorio") or "")[:5]
+    numero = str(int(numero)) if numero else ""
+    url = (request.args.get("url") or "").strip()
+    pista = (request.args.get("portaria") or "").strip()[:200]
+    tecnologia = (request.args.get("tecnologia") or "").strip()[:120]
+    if not numero and not url:
+        return jsonify({"ok": False, "erro": "informe 'relatorio' (número) ou 'url' (gov.br/conitec)"}), 200
+    chave = "|".join((numero, url, pista))
+    agora = time.time()
+    if request.args.get("atualizar") != "1" and chave in _CONITEC_CACHE and _CONITEC_CACHE[chave][0] > agora:
+        resp = dict(_CONITEC_CACHE[chave][1])
+        resp["cache"] = True
+        resp["ms"] = int((time.time() - t0) * 1000)
+        return jsonify(resp), 200
+    try:
+        resp = _cn_resolver(numero, url, pista, tecnologia)
+    except _CnPrazo as e:
+        resp = {"ok": False, "relatorio": {"numero": numero}, "erro": str(e)}
+    except Exception as e:
+        resp = {"ok": False, "relatorio": {"numero": numero}, "erro": str(e)[:300]}
+    _CONITEC_CACHE[chave] = (agora + (_CONITEC_OK_S if resp.get("ok") else _CONITEC_FALHA_S), resp)
+    if len(_CONITEC_CACHE) > 2000:
+        for k in sorted(_CONITEC_CACHE, key=lambda k: _CONITEC_CACHE[k][0])[:500]:
+            _CONITEC_CACHE.pop(k, None)
+    resp = dict(resp)
+    resp["cache"] = False
+    resp["ms"] = int((time.time() - t0) * 1000)
+    return jsonify(resp), 200
+
+
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
