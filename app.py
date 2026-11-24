@@ -47,7 +47,7 @@ _lock_ocr = threading.Lock()
 # chama o Railway — mesmo modelo ja usado para a chave do Gemini.
 # ============================================================
 NAT_API_KEY = os.environ.get("NAT_API_KEY", "").strip()
-VERSAO = "2026-11-23b"  # (23/11/2026 b) nova rota GET /conitec/decisao (texto da portaria decisória no gov.br)
+VERSAO = "2026-11-23c"  # (23/11/2026 b) nova rota GET /conitec/decisao (texto da portaria decisória no gov.br)
 # (20/09/2026 n) a lista CMED e carregada na primeira consulta a /cmed (ver _carregar_cmed)
 
 
@@ -3646,8 +3646,8 @@ CONITEC_BASE = "https://www.gov.br/conitec/pt-br"
 CONITEC_PRAZO_S = float(os.environ.get("CONITEC_PRAZO_S", "25"))
 _CONITEC_CACHE = {}          # chave -> (expira_em, resposta)
 _CONITEC_INDICE = {"em": 0, "linhas": None, "url": None, "erro": None}
-_CONITEC_OK_S = 7 * 86400
-_CONITEC_FALHA_S = 3600
+_CONITEC_OK_S = 600   # 23/11/2026 c: a fonte da verdade é a aba CONITEC da planilha NATJUS; aqui só evita repetir na mesma rodada
+_CONITEC_FALHA_S = 300
 _MESES = ["janeiro", "fevereiro", "marco", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro",
           "novembro", "dezembro"]
 
